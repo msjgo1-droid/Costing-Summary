@@ -131,7 +131,9 @@ def _is_yellow(cell) -> bool:
     return bool(rgb) and rgb.upper() in YELLOW_FILLS
 
 
-CBS_RE = re.compile(r"CBS\s*([0-9]{1,2}/[0-9]{1,2})\D*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+# 날짜는 'CBS 9/9 $13.92' 처럼 슬래시로 적힌 경우와 'CBS 0909 $13.92' 처럼
+# 슬래시 없이 4자리(MMDD)로 적힌 경우가 둘 다 있어 둘 다 인식한다.
+CBS_RE = re.compile(r"CBS\s*([0-9]{1,2}/[0-9]{1,2}|[0-9]{4})\D*\$?\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 
 def _find_header_rows(ws):
@@ -244,10 +246,16 @@ def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
 
 
 def parse_date_text(date_text: str, fallback_year: Optional[int] = None) -> Optional[dt.date]:
-    m = re.match(r"^(\d{1,2})/(\d{1,2})$", date_text.strip())
-    if not m:
-        return None
-    month, day = int(m.group(1)), int(m.group(2))
+    text = date_text.strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})$", text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+    else:
+        # 슬래시 없이 'MMDD' 4자리로 적힌 경우 (예: '0909' -> 9/9, '0916' -> 9/16)
+        m2 = re.match(r"^(\d{2})(\d{2})$", text)
+        if not m2:
+            return None
+        month, day = int(m2.group(1)), int(m2.group(2))
     year = fallback_year or dt.date.today().year
     try:
         return dt.date(year, month, day)

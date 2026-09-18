@@ -39,9 +39,10 @@ def _compose_remark(blocks: list) -> tuple[str, bool]:
     base_note = latest.remark.strip() if latest.remark else ""
     if base_note:
         lines.append(base_note)
+        # 노란색 강조가 아니어도 REMARK 텍스트 자체는 그대로 사용하고,
+        # 화면에 노출되는 문구는 남기지 않는다 (review_flags로만 내부 추적).
         if not latest.remark_is_yellow:
             needs_review = True
-            lines[-1] += "  [검토 필요: 노란색 강조 아님]"
     else:
         needs_review = True
         lines.append("[검토 필요: REMARK 미검출]")
