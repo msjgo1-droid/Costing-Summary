@@ -1,7 +1,21 @@
 """parser.py 의 결과(스타일 정보 + 컬러웨이별 DateBlock 목록)를
 summary_builder.SummaryRow 로 변환하는 연결 코드.
+
+날짜 그대로 컬럼을 늘리면 컬럼 수가 너무 많아지고 빈 칸이 많아지므로, 시트 탭 이름에
+적힌 샘플 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)와 CBS 날짜의 '월'만 묶어서 하나의
+컬럼(예: "PP Jul", "GTM2 Jun")으로 합친다. 같은 단계+월에 여러 번 제출된 경우
+가장 최근(날짜가 늦은) 값으로 덮어써서 대표값 하나만 남긴다.
 """
+import calendar
+
 from summary_builder import SummaryRow
+from parser import extract_stage
+
+
+def stage_month_label(sheet_name: str, date) -> str:
+    stage = extract_stage(sheet_name)
+    mon = calendar.month_abbr[date.month]  # Jan, Feb, ... Jul, ...
+    return f"{stage} {mon}"
 
 
 def _compose_remark(blocks: list) -> tuple[str, bool]:
@@ -40,10 +54,24 @@ def _compose_remark(blocks: list) -> tuple[str, bool]:
     return "\n".join(lines), needs_review
 
 
+def _bucket_by_stage_month(blocks: list) -> dict:
+    """(단계+월) 라벨별로 가장 최근 제출 값 하나만 남긴다."""
+    dated = [b for b in blocks if b.date is not None and b.fob is not None]
+    buckets: dict[str, object] = {}
+    for b in dated:
+        label = stage_month_label(b.sheet_name, b.date)
+        if label not in buckets or b.date > buckets[label].date:
+            buckets[label] = b
+    return {
+        label: {"fob": b.fob, "cm": b.cm, "margin": b.margin, "date": b.date}
+        for label, b in buckets.items()
+    }
+
+
 def submitted_to_summary_rows(style_info, blocks_by_colorway: dict, season_override: str = "") -> list:
     rows = []
     for colorway, blocks in blocks_by_colorway.items():
-        dated_blocks = {b.date: {"fob": b.fob, "cm": b.cm, "margin": b.margin} for b in blocks if b.date is not None and b.fob is not None}
+        dated_blocks = _bucket_by_stage_month(blocks)
         remark_text, needs_review = _compose_remark(blocks)
         row = SummaryRow(
             season=season_override or style_info.season,

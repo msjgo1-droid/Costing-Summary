@@ -23,6 +23,27 @@ STOPWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# 시트 탭 이름에 적혀있는 샘플 단계 키워드. 왼쪽에 나올수록(문자열 상 더 앞쪽 위치)
+# 우선한다 (예: 'GTM2-F27 PP 6.03' -> GTM2가 PP보다 앞에 있으므로 GTM2로 판단).
+STAGE_KEYWORDS = ["GTM2", "GTM1", "SMS", "PP", "P1", "P2", "P3"]
+STAGE_ORDER = {name: i for i, name in enumerate(["P1", "P2", "P3", "GTM1", "GTM2", "PP", "SMS"])}
+
+
+def extract_stage(sheet_name: str) -> str:
+    """시트 탭 이름에서 샘플 단계(P1/P2/P3/GTM1/GTM2/SMS/PP)를 찾는다.
+    여러 개가 동시에 있으면(예: 'GTM2-F27 PP 6.03') 이름에서 더 앞쪽에 나온 것을 사용한다.
+    못 찾으면 시트 이름 앞부분을 그대로 사용한다."""
+    best = None
+    for kw in STAGE_KEYWORDS:
+        m = re.search(rf"\b{kw}\b", sheet_name, re.IGNORECASE)
+        if m and (best is None or m.start() < best[1]):
+            best = (kw, m.start())
+    if best:
+        return best[0]
+    # 못 찾으면 숫자/구두점을 뺀 첫 단어를 임시 라벨로 사용
+    m = re.search(r"[A-Za-z]{2,}", sheet_name)
+    return m.group(0).upper() if m else sheet_name.strip()
+
 
 @dataclass
 class StyleInfo:

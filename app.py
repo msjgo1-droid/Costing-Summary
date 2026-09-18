@@ -122,23 +122,30 @@ if rows:
         key="master_editor",
     )
 
-    st.subheader("날짜별 FOB / CM / MARGIN %")
-    st.caption("MARGIN %는 각 SUBMITTED 시트 하단(CBS와 같은 행, LOSS 열)의 값을 그대로 읽어온 것입니다. 값이 비어 있으면 해당 위치를 찾지 못한 것이니 확인해주세요.")
+    st.subheader("단계(STAGE) / 월별 FOB · CM · MARGIN %")
+    st.caption(
+        "정확한 날짜 대신 시트 탭 이름의 샘플 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)와 "
+        "제출월만 묶어서 하나의 컬럼으로 표시합니다 (예: 'PP Jul'). 같은 단계+월에 "
+        "제출이 여러 번 있으면 가장 최근 값만 남깁니다. STAGE 라벨은 표에서 직접 수정할 수 있습니다. "
+        "MARGIN %는 각 시트 하단(CBS와 같은 행, LOSS 열)의 값을 그대로 읽어온 것입니다."
+    )
     date_rows = []
     for i, r in enumerate(rows):
-        for d, info in sorted(r.dates.items()):
+        for label, info in sorted(r.dates.items(), key=lambda kv: kv[1].get("date") or dt.date.min):
             margin = info.get("margin")
             date_rows.append(
                 {
                     "_idx": i,
                     "STYLE NO": r.style_no,
                     "COLORWAY": r.colorway,
-                    "DATE": d,
+                    "STAGE": label,
                     "FOB": info.get("fob"),
                     "CM": info.get("cm"),
                     # 표에서는 사람이 보기 편하게 %값(예: 16.12)으로 표시/입력하고,
                     # 최종 저장 시 소수(0.1612)로 다시 변환한다.
                     "MARGIN %": (margin * 100) if margin is not None else None,
+                    # 정렬용 원본 날짜 (화면에는 안 보이지만 SUMMARY 생성 시 컬럼 순서를 정하는 데 씀)
+                    "_date": info.get("date"),
                 }
             )
     date_df = pd.DataFrame(date_rows)
@@ -147,6 +154,8 @@ if rows:
             date_df,
             column_config={
                 "_idx": None,
+                "_date": None,
+                "STAGE": st.column_config.TextColumn(help="예: 'PP Jul', 'GTM2 Jun', 'SMS Sep'. 잘못 인식됐으면 직접 수정하세요."),
                 "MARGIN %": st.column_config.NumberColumn(
                     help="자동 추출된 값입니다. 비어 있거나 틀렸으면 직접 입력/수정하세요. (예: 16.12 = 16.12%)",
                     format="%.2f",
@@ -168,15 +177,21 @@ if rows:
             dsub = edited_dates[edited_dates["_idx"] == idx] if not edited_dates.empty else edited_dates
             dates = {}
             for _, drow in dsub.iterrows():
-                d = drow["DATE"]
-                if isinstance(d, str):
-                    d = pd.to_datetime(d).date()
-                elif isinstance(d, pd.Timestamp):
-                    d = d.date()
-                dates[d] = {
+                label = str(drow["STAGE"]).strip()
+                if not label or label.lower() == "nan":
+                    continue
+                raw_date = drow.get("_date")
+                if raw_date is None or (not isinstance(raw_date, dt.date) and pd.isna(raw_date)):
+                    raw_date = None
+                elif isinstance(raw_date, pd.Timestamp):
+                    raw_date = raw_date.date()
+                elif not isinstance(raw_date, dt.date):
+                    raw_date = None
+                dates[label] = {
                     "fob": drow["FOB"] if pd.notna(drow["FOB"]) else None,
                     "cm": drow["CM"] if pd.notna(drow["CM"]) else None,
                     "margin": (drow["MARGIN %"] / 100.0) if pd.notna(drow["MARGIN %"]) else None,
+                    "date": raw_date,
                 }
             final_rows.append(
                 SummaryRow(
@@ -218,6 +233,10 @@ with st.expander("ℹ️ 추출 규칙 안내"):
         """
 - **시즌 / 스타일 / DESCRIPTION**: 파일명 시작 부분의 `S27-1234567_M FlyLux ...` 형식에서 자동 추출합니다.
 - **제출일자 / FOB**: 각 시트의 `CBS <날짜> $<가격>` 문구를 찾아 사용합니다. (시트 탭 이름이 아닌 CBS 문구 기준)
+- **컬럼 구성 (단계+월)**: 정확한 날짜별로 컬럼을 나누면 빈 칸/컬럼이 너무 많아지므로, 시트 탭 이름의
+  샘플 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)와 CBS 날짜의 월만 묶어 하나의 컬럼(예: `PP Jul`)으로
+  만듭니다. 같은 단계+월에 여러 번 제출됐으면 가장 최근 값만 남습니다. 기존 SUMMARY 파일의
+  `SUBMITTED 4/29`처럼 예전 방식으로 저장된 컬럼은 그대로 유지됩니다.
 - **CM**: CM 행의 좌측(제안가 블록) TTL 값을 사용합니다.
 - **REMARK**: CM 옆 우측 REMARK 칸 중 노란색으로 강조된 내용을 가져오고, 노란색이 아니면 `[검토 필요]`로 표시됩니다.
 - **단계별 변경점**: 시트가 여러 개인 경우, 노란색으로 강조된 값이 이전 단계 대비 달라진 항목을 자동으로 REMARK에 함께 기록합니다. (참고용이며 확인이 필요합니다)

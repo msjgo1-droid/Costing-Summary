@@ -12,10 +12,16 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Optional
 
+import calendar
+
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference
+
+from parser import STAGE_ORDER
+
+MONTH_NUM = {abbr.upper(): i for i, abbr in enumerate(calendar.month_abbr) if abbr}
 
 THIN = Side(style="thin")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -31,7 +37,9 @@ class SummaryRow:
     colorway: str  # "SOLID" / "HEATHER" / "" (컬러웨이 구분 없는 단일 항목)
     description: str
     no: str = ""
-    dates: dict = field(default_factory=dict)  # {date: {"fob":float,"cm":float,"margin":float|None}}
+    # {label(str, 예: "PP Jul", "GTM2 Jun", 또는 기존 파일의 "SUBMITTED 4/29"):
+    #   {"fob":float, "cm":float, "margin":float|None, "date": date|None(정렬용)}}
+    dates: dict = field(default_factory=dict)
     remark: str = ""
 
     @property
@@ -92,9 +100,10 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
             if cm_col and j < len(cols_sorted) and "MARGIN" in col_headers[cols_sorted[j]]:
                 margin_col = cols_sorted[j]
                 j += 1
-            # 날짜 그룹 라벨은 보통 한 행 위(header_row-1) 병합 셀에 있음
-            group_label = ws.cell(row=header_row - 1, column=fob_col).value or label
-            m = DATE_IN_TEXT_RE.search(str(group_label))
+            # 그룹 라벨은 보통 한 행 위(header_row-1) 병합 셀에 있음 (예: "SUBMITTED 4/29",
+            # 또는 새 방식이면 "PP Jul" 처럼 이미 단계+월 라벨이 들어있음)
+            group_label = str(ws.cell(row=header_row - 1, column=fob_col).value or label).strip()
+            m = DATE_IN_TEXT_RE.search(group_label)
             gdate = None
             if m:
                 month, day = int(m.group(1)), int(m.group(2))
@@ -102,7 +111,7 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
                     gdate = dt.date(dt.date.today().year, month, day)
                 except ValueError:
                     gdate = None
-            date_groups.append({"fob_col": fob_col, "cm_col": cm_col, "margin_col": margin_col, "date": gdate})
+            date_groups.append({"fob_col": fob_col, "cm_col": cm_col, "margin_col": margin_col, "label": group_label, "date": gdate})
             i = j if j > i + 1 else i + 1
         else:
             i += 1
@@ -131,11 +140,11 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
             margin = ws.cell(row=r, column=g["margin_col"]).value if g["margin_col"] else None
             if fob is None and cm is None:
                 continue
-            key_date = g["date"] or dt.date(1900, 1, 1) + dt.timedelta(days=len(dates))
-            dates[key_date] = {
+            dates[g["label"]] = {
                 "fob": fob if isinstance(fob, (int, float)) else None,
                 "cm": cm if isinstance(cm, (int, float)) else None,
                 "margin": margin if isinstance(margin, (int, float)) else None,
+                "date": g["date"],
             }
 
         rows.append(
@@ -173,18 +182,31 @@ def merge_rows(existing: list[SummaryRow], new: list[SummaryRow]) -> list[Summar
     return [by_key[k] for k in ordered_keys]
 
 
-def _date_label(idx: int, total: int, d: dt.date) -> str:
-    txt = f"{d.month}/{d.day}"
-    if idx == 0:
-        return f"SUBMITTED {txt}"
-    if idx == total - 1:
-        return f"NEGOTIATED {txt}"
-    return f"FOB {txt}"
+def _label_sort_key(label: str, repr_date):
+    """컬럼(라벨) 정렬 기준. 대표 날짜가 있으면 그걸로, 없으면 라벨 텍스트에서
+    '단계 + 월(3글자 영문)' 패턴을 다시 파싱해서 정렬한다 (예: 'PP Jul')."""
+    if repr_date:
+        stage = label.split()[0].upper() if label.split() else ""
+        return (0, repr_date.year, repr_date.month, STAGE_ORDER.get(stage, 50))
+    parts = label.split()
+    stage = parts[0].upper() if parts else ""
+    mon = parts[-1].upper()[:3] if len(parts) > 1 else ""
+    return (1, 9999, MONTH_NUM.get(mon, 13), STAGE_ORDER.get(stage, 50))
 
 
 def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str) -> openpyxl.Workbook:
-    all_dates = sorted({d for r in rows for d in r.dates.keys()})
-    n_dates = len(all_dates)
+    # 라벨별 대표 날짜(정렬용): 여러 행에 걸쳐 처음 발견된 날짜를 사용
+    repr_date_by_label: dict = {}
+    for r in rows:
+        for label, info in r.dates.items():
+            if label not in repr_date_by_label and info.get("date"):
+                repr_date_by_label[label] = info["date"]
+
+    all_labels = sorted(
+        {label for r in rows for label in r.dates.keys()},
+        key=lambda lb: _label_sort_key(lb, repr_date_by_label.get(lb)),
+    )
+    n_dates = len(all_labels)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -214,16 +236,15 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
         style_header(c, fill=HEADER_FILL)
         ws.merge_cells(start_row=header_row - 1, start_column=i + 1, end_row=header_row, end_column=i + 1)
 
-    # 날짜 그룹 헤더
-    for gi, d in enumerate(all_dates):
+    # 라벨(단계+월) 그룹 헤더
+    for gi, label in enumerate(all_labels):
         base_col = first_date_col + gi * group_width
-        label = _date_label(gi, n_dates, d)
         top = ws.cell(row=header_row - 1, column=base_col, value=label)
         top.font = Font(name="맑은 고딕", bold=True, size=11, color=BLUE)
         top.alignment = Alignment(horizontal="center", vertical="center")
         ws.merge_cells(start_row=header_row - 1, start_column=base_col, end_row=header_row - 1, end_column=base_col + 2)
         for k, sub in enumerate(["FOB", "CM", "MARGIN %"]):
-            c = ws.cell(row=header_row, column=base_col + k, value=sub if sub != "FOB" else f"FOB {d.month}/{d.day}")
+            c = ws.cell(row=header_row, column=base_col + k, value=sub)
             style_header(c, color=BLUE if sub != "MARGIN %" else None, fill=HEADER_FILL)
 
     tsc = ws.cell(row=header_row, column=total_saving_col, value="TOTAL FOB SAVING")
@@ -250,9 +271,9 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
 
         first_fob_col_letter = None
         last_fob_col_letter = None
-        for gi, d in enumerate(all_dates):
+        for gi, label in enumerate(all_labels):
             base_col = first_date_col + gi * group_width
-            info = row_data.dates.get(d, {})
+            info = row_data.dates.get(label, {})
             fob, cm, margin = info.get("fob"), info.get("cm"), info.get("margin")
 
             fob_cell = ws.cell(row=r, column=base_col, value=fob)
@@ -298,7 +319,7 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
     widths = {1: 9, 2: 7, 3: 16, 4: 24}
     for col, w in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = w
-    for gi in range(n_dates):
+    for gi in range(len(all_labels)):
         base_col = first_date_col + gi * group_width
         ws.column_dimensions[get_column_letter(base_col)].width = 13
         ws.column_dimensions[get_column_letter(base_col + 1)].width = 8
@@ -311,27 +332,29 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
     # ---- 비교 차트 (제출일이 3개 이상인 스타일만) ----
     chart_ws = None
     for row_idx, row_data in enumerate(rows):
-        dated = sorted(row_data.dates.items())
-        if len(dated) <= 2:
+        # 이 행에 실제로 값이 있는 라벨만, 전체 컬럼 순서(all_labels) 기준으로 정렬
+        present = [lb for lb in all_labels if lb in row_data.dates]
+        if len(present) <= 2:
             continue
         if chart_ws is None:
             chart_ws = wb.create_sheet("Comparison Charts")
             chart_ws.sheet_view.showGridLines = False
-            chart_ws["A1"] = "날짜별 FOB/CM 비교 차트 (제출 3회 이상 스타일)"
+            chart_ws["A1"] = "단계/월별 FOB·CM 비교 차트 (제출 3회 이상 스타일)"
             chart_ws["A1"].font = Font(bold=True, size=12)
 
         data_row = 4 + row_idx * 12
         title = f"{row_data.style_no} / {row_data.colorway or '-'}  {row_data.description}"
         chart_ws.cell(row=data_row, column=1, value=title).font = Font(bold=True, size=10)
-        chart_ws.cell(row=data_row + 1, column=1, value="DATE")
+        chart_ws.cell(row=data_row + 1, column=1, value="STAGE")
         chart_ws.cell(row=data_row + 1, column=2, value="FOB")
         chart_ws.cell(row=data_row + 1, column=3, value="CM")
-        for k, (d, info) in enumerate(dated):
-            chart_ws.cell(row=data_row + 2 + k, column=1, value=f"{d.month}/{d.day}")
+        for k, lb in enumerate(present):
+            info = row_data.dates[lb]
+            chart_ws.cell(row=data_row + 2 + k, column=1, value=lb)
             chart_ws.cell(row=data_row + 2 + k, column=2, value=info.get("fob"))
             chart_ws.cell(row=data_row + 2 + k, column=3, value=info.get("cm"))
 
-        n = len(dated)
+        n = len(present)
         chart = LineChart()
         chart.title = title
         chart.height, chart.width = 7, 14
@@ -342,7 +365,7 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
         chart.add_data(cm_ref, titles_from_data=True)
         chart.set_categories(cats)
         chart.y_axis.title = "USD"
-        chart.x_axis.title = "Submitted Date"
+        chart.x_axis.title = "Stage / Month"
         anchor = f"E{data_row}"
         chart_ws.add_chart(chart, anchor)
 
