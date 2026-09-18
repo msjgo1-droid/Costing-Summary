@@ -191,25 +191,43 @@ def _find_cm_row(ws, item_col: int, start_row: int, end_row: int):
     return None
 
 
-STYLE_NO_RE = re.compile(r"\b(\d{7})\b")
+STYLE_NO_LEADING_RE = re.compile(r"^\s*(\d{7})\b")
+
+
+def _sketch_color_col(ws, header_row: int, max_col: int = 8) -> Optional[int]:
+    """헤더 행에서 'SKETCH/COLOR' 라벨이 있는 열을 찾는다."""
+    for c in range(1, max_col + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if isinstance(v, str) and "SKETCH" in v.strip().upper():
+            return c
+    return None
 
 
 def _declared_style_no(ws, header_row: int) -> Optional[str]:
-    """블록 헤더 근처(예: 스타일명이 적힌 셀)에서 7자리 스타일번호를 찾는다.
-    파일명의 스타일번호와 다르면 그 블록은 잘못 섞여 들어간 것으로 보고 무시하기 위함."""
-    for r in range(max(1, header_row - 6), header_row + 3):
-        for c in range(1, 7):
-            v = ws.cell(row=r, column=c).value
-            if v is None:
-                continue
-            m = STYLE_NO_RE.search(str(v))
-            if m:
-                return m.group(1)
+    """블록의 SKETCH/COLOR 칸(예: '1184056 Trail Bottom ET PRT')맨 앞에 적힌
+    7자리 스타일번호를 찾는다. 파일명의 스타일번호와 다르면 그 블록은 잘못 섞여
+    들어간 것으로 보고 무시하기 위함.
+
+    S/# 칸에는 'PRINT VERSION OF 1181433', 'REPEAT OF F26-1170233' 처럼 다른
+    스타일번호를 참고용으로 언급하는 메모가 적히는 경우가 있어, 그 칸은 보지 않고
+    SKETCH/COLOR 칸(숫자로 시작하는 셀)만 확인한다."""
+    sc_col = _sketch_color_col(ws, header_row)
+    if sc_col is None:
+        return None
+    for r in range(header_row + 1, header_row + 8):
+        v = ws.cell(row=r, column=sc_col).value
+        if v is None:
+            continue
+        m = STYLE_NO_LEADING_RE.match(str(v))
+        if m:
+            return m.group(1)
     return None
 
 
 def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
-    """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 SOLID/HEATHER 등 컬러웨이 추정."""
+    """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 컬러웨이를 추정한다.
+    컬러 관련 표기가 전혀 없으면 SOLID로 본다 (PRINT/HEATHER는 항상 별도로
+    명시적으로 표기되어 있다는 것이 확인된 규칙)."""
     texts = []
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
@@ -218,6 +236,8 @@ def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     blob = " ".join(texts).upper()
     if "HEATHER" in blob:
         return "HEATHER"
+    if re.search(r"\bPRINT\b", blob) or re.search(r"\bPRT\b", blob):
+        return "PRINT"
     if "SOLID" in blob:
         return "SOLID"
     return "SOLID" if header_row < end_row else "COLOR 2"
