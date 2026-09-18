@@ -269,7 +269,11 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
     header_rows.sort()
     for idx, hr in enumerate(header_rows):
         item_col = 4  # 'ITEM' 은 통상 D열
-        next_hr = header_rows[idx + 1] if idx + 1 < len(header_rows) else ws.max_row
+        # 마지막 블록이면 시트의 맨 마지막 행까지 포함해야 하므로 ws.max_row + 1을 써서
+        # 아래에서 (next_hr - 1)로 계산되는 블록의 끝 행이 ws.max_row 자체가 되도록 한다.
+        # (CBS/마진%이 시트의 맨 마지막 행에 적혀있는 경우가 있어, 이 부분이 한 칸
+        # 모자라게 계산되면 CBS/마진%를 못 찾는 문제가 있었다)
+        next_hr = header_rows[idx + 1] if idx + 1 < len(header_rows) else ws.max_row + 1
 
         declared = _declared_style_no(ws, hr)
         if declared and style_no and declared != style_no:
