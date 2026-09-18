@@ -29,10 +29,13 @@ STAGE_KEYWORDS = ["GTM2", "GTM1", "SMS", "PP", "P1", "P2", "P3"]
 STAGE_ORDER = {name: i for i, name in enumerate(["P1", "P2", "P3", "GTM1", "GTM2", "PP", "SMS"])}
 
 
+SEASON_TOKEN_RE = re.compile(r"^[SF]\d{2}$", re.IGNORECASE)  # S27, F27, S28 같은 시즌 표기
+
+
 def extract_stage(sheet_name: str) -> str:
     """시트 탭 이름에서 샘플 단계(P1/P2/P3/GTM1/GTM2/SMS/PP)를 찾는다.
     여러 개가 동시에 있으면(예: 'GTM2-F27 PP 6.03') 이름에서 더 앞쪽에 나온 것을 사용한다.
-    못 찾으면 시트 이름 앞부분을 그대로 사용한다."""
+    못 찾으면 시트 이름에서 시즌 표기(S27/F27 등)는 제외하고 그 다음 단어를 임시 라벨로 사용한다."""
     best = None
     for kw in STAGE_KEYWORDS:
         m = re.search(rf"\b{kw}\b", sheet_name, re.IGNORECASE)
@@ -40,9 +43,13 @@ def extract_stage(sheet_name: str) -> str:
             best = (kw, m.start())
     if best:
         return best[0]
-    # 못 찾으면 숫자/구두점을 뺀 첫 단어를 임시 라벨로 사용
-    m = re.search(r"[A-Za-z]{2,}", sheet_name)
-    return m.group(0).upper() if m else sheet_name.strip()
+    # 못 찾으면 시즌 표기(S27/F27)를 제외한 첫 영문 단어를 임시 라벨로 사용
+    for m in re.finditer(r"[A-Za-z]{2,}\d{0,2}", sheet_name):
+        token = m.group(0)
+        if SEASON_TOKEN_RE.match(token):
+            continue
+        return token.upper()
+    return "ETC"
 
 
 @dataclass
@@ -71,6 +78,7 @@ class DateBlock:
     left_ttl_col: int
     right_ttl_col: int
     diffs: list = field(default_factory=list)  # 이전 날짜 대비 변경점 (문자열 리스트)
+    sheet_order: int = 0  # 시트 탭 순서(값이 클수록 최신). 날짜가 같을 때 동점 처리용
 
 
 def parse_filename(filename: str) -> StyleInfo:
@@ -183,6 +191,23 @@ def _find_cm_row(ws, item_col: int, start_row: int, end_row: int):
     return None
 
 
+STYLE_NO_RE = re.compile(r"\b(\d{7})\b")
+
+
+def _declared_style_no(ws, header_row: int) -> Optional[str]:
+    """블록 헤더 근처(예: 스타일명이 적힌 셀)에서 7자리 스타일번호를 찾는다.
+    파일명의 스타일번호와 다르면 그 블록은 잘못 섞여 들어간 것으로 보고 무시하기 위함."""
+    for r in range(max(1, header_row - 6), header_row + 3):
+        for c in range(1, 7):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            m = STYLE_NO_RE.search(str(v))
+            if m:
+                return m.group(1)
+    return None
+
+
 def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 SOLID/HEATHER 등 컬러웨이 추정."""
     texts = []
@@ -211,16 +236,28 @@ def parse_date_text(date_text: str, fallback_year: Optional[int] = None) -> Opti
 
 
 def parse_sheet(ws, sheet_name: str, style_no: str):
-    """워크시트 하나에서 컬러웨이별 DateBlock 리스트를 뽑는다."""
+    """워크시트 하나에서 컬러웨이별 DateBlock 리스트를 뽑는다.
+
+    반환: (blocks, skip_notes) - skip_notes 는 파일명과 다른 스타일번호가 적혀 있어
+    무시한 블록에 대한 안내 메시지 리스트."""
     blocks = []
+    skip_notes = []
     header_rows = [r for r, c in _find_header_rows(ws)]
     if not header_rows:
-        return blocks
+        return blocks, skip_notes
 
     header_rows.sort()
     for idx, hr in enumerate(header_rows):
         item_col = 4  # 'ITEM' 은 통상 D열
         next_hr = header_rows[idx + 1] if idx + 1 < len(header_rows) else ws.max_row
+
+        declared = _declared_style_no(ws, hr)
+        if declared and style_no and declared != style_no:
+            skip_notes.append(
+                f"[{sheet_name}] 시트 내 스타일번호({declared})가 파일명 스타일번호({style_no})와 달라 해당 블록을 무시했습니다."
+            )
+            continue
+
         ttl_cols, remark_cols = _ttl_and_remark_cols(ws, hr)
         if not ttl_cols:
             continue
@@ -283,7 +320,7 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
                 right_ttl_col=right_ttl,
             )
         )
-    return blocks
+    return blocks, skip_notes
 
 
 def _blocks_structurally_compatible(ws_a, ws_b, header_row_a: int, header_row_b: int, sample_rows: int = 10) -> bool:
@@ -365,33 +402,38 @@ def _diff_block_cells(ws_a, ws_b, header_row_a: int, header_row_b: int, end_row_
 def parse_submitted_workbook(path: str, filename_for_parsing: Optional[str] = None):
     """SUBMITTED 워크북 전체를 파싱해서 컬러웨이별 시간순 DateBlock 리스트를 반환.
 
-    반환: {colorway: [DateBlock, ...(날짜 오름차순)]}
+    반환: (style_info, {colorway: [DateBlock, ...(날짜 오름차순)]}, skip_notes)
     """
     fname = filename_for_parsing or path
     style_info = parse_filename(fname)
 
     wb = openpyxl.load_workbook(path, data_only=True)
     # 시트 탭 순서: 관찰된 실제 파일들은 "최신 -> 과거" 순으로 탭이 나열되어 있어
-    # 역순으로 뒤집으면 과거->최신 시간 순서에 근접한다. (CBS 날짜가 비어있는
-    # 중간 협상 단계 시트가 있어 날짜만으로는 완전한 정렬이 어렵기 때문에 보조 기준으로 사용)
+    # 역순으로 뒤집으면 과거->최신 시간 순서에 근접한다 (값이 클수록 최신/더 왼쪽 탭).
+    # CBS 날짜가 비어있는 중간 협상 단계 시트가 있어 날짜만으로는 완전한 정렬이 어렵고,
+    # 같은 날짜가 겹치는 경우의 동점 처리 기준으로도 사용한다.
     sheet_order = {name: idx for idx, name in enumerate(reversed(wb.sheetnames))}
 
     all_blocks_by_colorway: dict[str, list[DateBlock]] = {}
+    all_skip_notes: list[str] = []
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        blocks = parse_sheet(ws, sheet_name, style_info.style_no)
+        blocks, skip_notes = parse_sheet(ws, sheet_name, style_info.style_no)
+        all_skip_notes.extend(skip_notes)
         for b in blocks:
+            b.sheet_order = sheet_order.get(sheet_name, 0)
             # normalize colorway name: strip numbering suffix used only for
             # within-sheet de-dup and merge back for cross-sheet grouping
             base_colorway = re.sub(r"\s*#\d+$", "", b.colorway)
             all_blocks_by_colorway.setdefault(base_colorway, []).append(b)
 
-    # 날짜 파싱 및 정렬 (날짜가 있으면 날짜 우선, 없으면 시트 탭 순서로 보완)
+    # 날짜 파싱 및 정렬 (날짜가 있으면 날짜 우선, 없으면 시트 탭 순서로 보완;
+    # 날짜가 같으면 시트 탭 순서(sheet_order)가 더 큰 쪽=더 왼쪽/최신 탭이 뒤로 온다)
     for colorway, blocks in all_blocks_by_colorway.items():
         for b in blocks:
             b.date = parse_date_text(b.date_text) if b.date_text else None
-        blocks.sort(key=lambda b: (b.date or dt.date.min, sheet_order.get(b.sheet_name, 0)))
+        blocks.sort(key=lambda b: (b.date or dt.date.min, b.sheet_order))
 
     # 단계별 차이점(diff) 계산 - 같은 컬러웨이 내 시간순으로 인접한 시트를 비교하고,
     # CBS 날짜가 없는 중간 단계의 변경점은 다음 확정(날짜 있는) 단계에 함께 모아 기재한다.
@@ -419,4 +461,4 @@ def parse_submitted_workbook(path: str, filename_for_parsing: Optional[str] = No
         if pending_notes and blocks:
             blocks[-1].diffs = (blocks[-1].diffs or []) + pending_notes
 
-    return style_info, all_blocks_by_colorway
+    return style_info, all_blocks_by_colorway, all_skip_notes
