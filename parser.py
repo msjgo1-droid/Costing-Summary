@@ -31,6 +31,35 @@ STAGE_ORDER = {name: i for i, name in enumerate(["P1", "P2", "P3", "GTM1", "GTM2
 
 SEASON_TOKEN_RE = re.compile(r"^[SF]\d{2}$", re.IGNORECASE)  # S27, F27, S28 같은 시즌 표기
 
+# 대문자 경계로 단어를 분리할 때, 브랜드/제품명이라 분리하면 안 되는 예외 단어 목록.
+# (예: "FlyLux" -> "Fly Lux"로 잘못 쪼개지는 것을 방지)
+PRESERVE_COMPOUND_WORDS = ["FlyLux"]
+
+
+def _add_word_spacing(text: str) -> str:
+    """띄워쓰기가 안 된 Style Description(예: 'SkysummitCapacityShort')에 대문자
+    경계를 기준으로 띄워쓰기를 넣어준다 (예: 'Skysummit Capacity Short').
+    PRESERVE_COMPOUND_WORDS에 있는 단어는 분리하지 않고 그대로 둔다."""
+    if not text:
+        return text
+    protected = text
+    placeholders = {}
+    for i, w in enumerate(PRESERVE_COMPOUND_WORDS):
+        pattern = re.compile(re.escape(w), re.IGNORECASE)
+
+        def _sub(m, w=w, i=i):
+            key = f"\x00{i}\x00"
+            placeholders[key] = w
+            return key
+
+        protected = pattern.sub(_sub, protected)
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", protected)
+    s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
+    s = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", s)
+    for key, w in placeholders.items():
+        s = s.replace(key, w)
+    return s
+
 
 def extract_stage(sheet_name: str) -> str:
     """시트 탭 이름에서 샘플 단계(P1/P2/P3/GTM1/GTM2/SMS/PP)를 찾는다.
@@ -62,14 +91,19 @@ class StyleInfo:
 
 @dataclass
 class DateBlock:
-    """하나의 컬러웨이(colorway) x 하나의 제출일자 블록."""
+    """하나의 컬러웨이(colorway) x 하나의 제출일자 블록.
+
+    좌측(내부)과 우측(오픈/개정) 두 계열의 FOB/CM/MARGIN%을 각각 따로 갖는다.
+    내부 MARGIN%는 '1 - (내부 Net 합계 / 오픈 FOB)' 형태의 수식으로 계산되어 있는
+    파일이 많아, CM을 수정했을 때도 재계산할 수 있도록 내부 Net 합계(internal_net)도
+    함께 저장해둔다."""
     colorway: str
     date: Optional[dt.date]
     date_text: str
-    fob: Optional[float]
-    cm: Optional[float]
-    cm_right: Optional[float]
-    margin: Optional[float]
+    fob: Optional[float]  # 내부(좌측) FOB
+    cm: Optional[float]  # 내부(좌측) CM
+    cm_right: Optional[float]  # 오픈(우측) CM
+    margin: Optional[float]  # 내부(좌측) MARGIN%
     remark: str
     remark_is_yellow: bool
     sheet_name: str
@@ -79,6 +113,9 @@ class DateBlock:
     right_ttl_col: int
     diffs: list = field(default_factory=list)  # 이전 날짜 대비 변경점 (문자열 리스트)
     sheet_order: int = 0  # 시트 탭 순서(값이 클수록 최신). 날짜가 같을 때 동점 처리용
+    fob_right: Optional[float] = None  # 오픈(우측) FOB
+    margin_right: Optional[float] = None  # 오픈(우측) MARGIN% (파일에 없는 경우가 많음)
+    internal_net: Optional[float] = None  # 'Net' 행의 내부(좌측) 합계 (CM 포함, 마진 재계산용)
 
 
 def parse_filename(filename: str) -> StyleInfo:
@@ -103,6 +140,12 @@ def parse_filename(filename: str) -> StyleInfo:
     else:
         season, style_no, rest = m.groups()
 
+    # 성별 접두어(M/W)가 언더스코어 없이 바로 뒤 대문자 단어에 붙어있는 경우
+    # (예: 'MSTMNT3_Woven_Short', 'WSTMNT_Warm_Up_Jacket')를 대비해, 맨 앞의
+    # M/W 접두어를 분리해준다. 이렇게 하지 않으면 같은 상품(STMNT Warm Up Jacket)이
+    # 성별 인식/그룹핑에서 빠져 따로 떨어져 정렬된다.
+    rest = re.sub(r"^([MW])([A-Z]{2,})", r"\1_\2", rest)
+
     tokens = re.split(r"[_\-\s]+", rest)
     desc_tokens = []
     for tok in tokens:
@@ -112,6 +155,11 @@ def parse_filename(filename: str) -> StyleInfo:
             break
         desc_tokens.append(tok)
     description = " ".join(desc_tokens).strip()
+    # 띄워쓰기가 안 된 채로 붙어있는 단어들(예: 'SkysummitCapacityShort')을
+    # 대문자 경계 기준으로 띄워써서, 이미 띄워쓰기 되어있는 동일 상품명과
+    # 같은 그룹으로 묶여 정렬될 수 있도록 한다.
+    description = _add_word_spacing(description)
+    description = re.sub(r"\s+", " ", description).strip()
 
     return StyleInfo(season=season, style_no=style_no, description=description, raw_filename=filename)
 
@@ -189,6 +237,15 @@ def _find_cm_row(ws, item_col: int, start_row: int, end_row: int):
     for r in range(start_row, end_row + 1):
         v = ws.cell(row=r, column=item_col).value
         if isinstance(v, str) and v.strip().upper() == "CM":
+            return r
+    return None
+
+
+def _find_net_row(ws, item_col: int, start_row: int, end_row: int):
+    """ITEM 열에 'Net'이라고 적힌 행(내부 합계 행, CM 포함)을 찾는다."""
+    for r in range(start_row, end_row + 1):
+        v = ws.cell(row=r, column=item_col).value
+        if isinstance(v, str) and v.strip().upper() == "NET":
             return r
     return None
 
@@ -328,6 +385,29 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
 
         margin = _find_margin(ws, hr, cbs_row, left_ttl)
 
+        # 내부(좌측)/오픈(우측) FOB, MARGIN%을 각각 따로 읽는다.
+        # FOB는 CBS 문구 옆 숫자보다 해당 행의 실제 셀 값이 더 정확하므로, 있으면 그걸 우선 사용한다.
+        fob_right = None
+        if cbs_row is not None:
+            left_cell_val = ws.cell(row=cbs_row, column=left_ttl).value
+            if isinstance(left_cell_val, (int, float)):
+                fob = float(left_cell_val)
+            if right_ttl != left_ttl:
+                right_cell_val = ws.cell(row=cbs_row, column=right_ttl).value
+                if isinstance(right_cell_val, (int, float)):
+                    fob_right = float(right_cell_val)
+
+        margin_right = _find_margin(ws, hr, cbs_row, right_ttl) if right_ttl != left_ttl else None
+
+        # 내부 Net 합계(=CM 포함 내부 비용 합계) - CM을 수정했을 때 내부 MARGIN%을
+        # '1 - ((내부Net - 기존CM + 새CM) / 오픈FOB)' 식으로 재계산할 수 있도록 저장해둔다.
+        net_row = _find_net_row(ws, item_col, hr + 1, next_hr - 1)
+        internal_net = None
+        if net_row is not None:
+            v = ws.cell(row=net_row, column=left_ttl).value
+            if isinstance(v, (int, float)):
+                internal_net = float(v)
+
         colorway = _colorway_from_block(ws, hr, next_hr - 1)
         # 같은 시트에 같은 컬러웨이가 중복되면 구분자 추가
         existing = [b for b in blocks if b.colorway == colorway]
@@ -350,6 +430,9 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
                 cm_row=cm_row,
                 left_ttl_col=left_ttl,
                 right_ttl_col=right_ttl,
+                fob_right=fob_right,
+                margin_right=margin_right,
+                internal_net=internal_net,
             )
         )
     return blocks, skip_notes

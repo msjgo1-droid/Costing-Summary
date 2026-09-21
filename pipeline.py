@@ -3,7 +3,7 @@ summary_builder.SummaryRow 로 변환하는 연결 코드.
 
 날짜/단계별로 컬럼을 늘리면 컬럼 수가 너무 많아지고 빈 칸이 많아지므로, 컬러웨이별로
 가장 최근(날짜가 가장 늦은, 동점이면 시트 탭이 더 왼쪽/최신인 쪽) 제출분 딱 하나만
-SUMMARY의 한 줄에 반영한다. CM은 우측(open/개정) 값을 사용한다.
+SUMMARY의 한 줄에 반영한다. FOB/CM/MARGIN%은 내부(좌측)/오픈(우측) 값을 각각 따로 담는다.
 """
 import datetime as dt
 
@@ -68,13 +68,22 @@ def submitted_to_summary_rows(style_info, blocks_by_colorway: dict, season_overr
         remark_text, needs_review = _compose_remark(blocks)
 
         stage_label = extract_stage(latest.sheet_name) if latest else ""
-        fob = latest.fob if latest else None
-        # 우측("open"/개정) CM을 우선 사용하고, 없으면 좌측 값으로 보완
-        cm = None
-        margin = None
+
+        fob_internal = latest.fob if latest else None
+        cm_internal = latest.cm if latest else None
+        margin_internal = latest.margin if latest else None
+
+        # 오픈(우측) FOB/CM 값이 파일에 없는 경우, 내부 값으로 보완한다 (보통
+        # 좌우가 같거나 오픈 쪽만 채워져 있는 템플릿도 있어서). 오픈 MARGIN%는
+        # 원본 파일에 별도 셀 자체가 없어(계산 로직을 알 수 없어) 다루지 않는다.
+        fob_open = None
+        cm_open = None
+        other_cost_internal = None
         if latest is not None:
-            cm = latest.cm_right if latest.cm_right is not None else latest.cm
-            margin = latest.margin
+            fob_open = latest.fob_right if latest.fob_right is not None else fob_internal
+            cm_open = latest.cm_right if latest.cm_right is not None else cm_internal
+            if latest.internal_net is not None and cm_internal is not None:
+                other_cost_internal = latest.internal_net - cm_internal
 
         row = SummaryRow(
             season=season_override or style_info.season,
@@ -82,9 +91,12 @@ def submitted_to_summary_rows(style_info, blocks_by_colorway: dict, season_overr
             colorway=colorway,
             description=style_info.description,
             stage=stage_label,
-            fob=fob,
-            cm=cm,
-            margin=margin,
+            fob_internal=fob_internal,
+            cm_internal=cm_internal,
+            margin_internal=margin_internal,
+            fob_open=fob_open,
+            cm_open=cm_open,
+            other_cost_internal=other_cost_internal,
             remark=remark_text,
         )
         row.needs_review = needs_review  # type: ignore[attr-defined]

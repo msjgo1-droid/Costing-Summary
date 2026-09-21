@@ -2,9 +2,10 @@
 Costing Bulk SUMMARY 자동 생성 Streamlit 앱
 
 - SUBMITTED로 끝나는 원가(costing) 엑셀 파일을 1개 이상 업로드하면
-  스타일/시즌/DESCRIPTION과, 컬러웨이별 가장 최근 제출분의 FOB·CM·MARGIN%·REMARK를
-  자동으로 추출해 SUMMARY 엑셀을 만들어 준다.
+  스타일/시즌/DESCRIPTION과, 컬러웨이별 가장 최근 제출분의 내부/오픈
+  FOB·CM·MARGIN%·REMARK를 자동으로 추출해 SUMMARY 엑셀을 만들어 준다.
 - 기존 SUMMARY 파일을 함께 업로드하면 새 제출 데이터로 값을 덮어써서 업데이트한다.
+- 내부 CM을 수정하면 내부 MARGIN%이 자동으로 재계산되도록 수식으로 만든다.
 """
 import io
 
@@ -19,14 +20,16 @@ from summary_builder import (
     workbook_to_bytes,
     merge_rows,
     parse_existing_summary,
+    sort_rows,
 )
 
 st.set_page_config(page_title="Costing Bulk SUMMARY 생성기", layout="wide")
 
 st.title("📦 Costing Bulk SUMMARY 자동 생성기")
 st.caption(
-    "SUBMITTED 원가 엑셀에서 시즌·스타일·DESCRIPTION과 가장 최근 제출분의 FOB/CM/MARGIN%/REMARK를 "
-    "추출해 SUMMARY 파일을 만들거나 업데이트합니다. 자동 추출 결과는 생성 전에 반드시 검토·수정할 수 있습니다."
+    "SUBMITTED 원가 엑셀에서 시즌·스타일·DESCRIPTION과 가장 최근 제출분의 내부/오픈 "
+    "FOB·CM·MARGIN%·REMARK를 추출해 SUMMARY 파일을 만들거나 업데이트합니다. "
+    "자동 추출 결과는 생성 전에 반드시 검토·수정할 수 있습니다."
 )
 
 if "parsed_rows" not in st.session_state:
@@ -85,7 +88,7 @@ if st.button("📥 업로드한 파일에서 데이터 추출", type="primary", 
             warnings.append(f"⚠ 기존 SUMMARY 파일을 읽는 중 오류 발생 ({e})")
 
     st.session_state.existing_rows = existing_rows
-    st.session_state.parsed_rows = merge_rows(existing_rows, all_rows)
+    st.session_state.parsed_rows = sort_rows(merge_rows(existing_rows, all_rows))
     for w in warnings:
         st.warning(w)
     st.success(f"{len(all_rows)}개 컬러웨이 행을 추출했습니다. (기존 SUMMARY 행 {len(existing_rows)}개와 병합됨)")
@@ -95,8 +98,9 @@ rows: list[SummaryRow] = st.session_state.parsed_rows
 if rows:
     st.header("④ 추출 결과 확인 및 수정")
     st.caption(
-        "스타일/컬러웨이별로 가장 최근 제출분의 FOB·CM·MARGIN%만 한 줄로 표시합니다. "
-        "STAGE 칸은 그 값이 어느 단계(P1/PP/SMS 등)에서 나온 것인지 참고용입니다. "
+        "스타일/컬러웨이별로 가장 최근 제출분의 내부(제안)/오픈(개정) FOB·CM·MARGIN%을 각각 "
+        "한 줄로 표시합니다. 비슷한 Style Description끼리는 자동으로 묶여 정렬됩니다. "
+        "STAGE 칸은 이 값이 어느 단계(P1/PP/SMS 등)에서 나온 것인지 참고용입니다. "
         "자동으로 채워지지 않았거나 틀린 값은 표에서 직접 수정한 뒤 아래에서 SUMMARY를 생성하세요."
     )
 
@@ -109,11 +113,13 @@ if rows:
                 "COLORWAY": r.colorway,
                 "DESCRIPTION": r.description,
                 "STAGE": r.stage,
-                "FOB": r.fob,
-                "CM": r.cm,
+                "내부FOB": r.fob_internal,
+                "내부CM": r.cm_internal,
                 # 표에서는 사람이 보기 편하게 %값(예: 16.12)으로 표시/입력하고,
                 # 최종 저장 시 소수(0.1612)로 다시 변환한다.
-                "MARGIN %": (r.margin * 100) if r.margin is not None else None,
+                "내부MARGIN %": (r.margin_internal * 100) if r.margin_internal is not None else None,
+                "오픈FOB": r.fob_open,
+                "오픈CM": r.cm_open,
                 "REMARK": r.remark,
             }
             for i, r in enumerate(rows)
@@ -124,10 +130,10 @@ if rows:
         column_config={
             "_idx": None,
             "STAGE": st.column_config.TextColumn(
-                help="이 FOB/CM/MARGIN% 값이 어느 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)에서 나온 것인지 참고용 표시입니다. 잘못 인식됐으면 직접 수정하세요."
+                help="이 값들이 어느 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)에서 나온 것인지 참고용 표시입니다. 잘못 인식됐으면 직접 수정하세요."
             ),
-            "MARGIN %": st.column_config.NumberColumn(
-                help="자동 추출된 값입니다. 비어 있거나 틀렸으면 직접 입력/수정하세요. (예: 16.12 = 16.12%)",
+            "내부MARGIN %": st.column_config.NumberColumn(
+                help="자동 추출된 값입니다. 생성된 엑셀에서는 내부CM을 바꾸면 이 값도 자동 재계산되는 수식으로 들어갑니다.",
                 format="%.2f",
             ),
             "REMARK": st.column_config.TextColumn(width="large"),
@@ -148,9 +154,15 @@ if rows:
                     colorway=mrow["COLORWAY"],
                     description=mrow["DESCRIPTION"],
                     stage=mrow["STAGE"] or "",
-                    fob=mrow["FOB"] if pd.notna(mrow["FOB"]) else None,
-                    cm=mrow["CM"] if pd.notna(mrow["CM"]) else None,
-                    margin=(mrow["MARGIN %"] / 100.0) if pd.notna(mrow["MARGIN %"]) else None,
+                    fob_internal=mrow["내부FOB"] if pd.notna(mrow["내부FOB"]) else None,
+                    cm_internal=mrow["내부CM"] if pd.notna(mrow["내부CM"]) else None,
+                    margin_internal=(mrow["내부MARGIN %"] / 100.0) if pd.notna(mrow["내부MARGIN %"]) else None,
+                    fob_open=mrow["오픈FOB"] if pd.notna(mrow["오픈FOB"]) else None,
+                    cm_open=mrow["오픈CM"] if pd.notna(mrow["오픈CM"]) else None,
+                    other_cost_internal=next(
+                        (r.other_cost_internal for r in rows if r.style_no == str(mrow["STYLE NO"]) and r.colorway == mrow["COLORWAY"]),
+                        None,
+                    ),
                     remark=mrow["REMARK"] or "",
                 )
             )
@@ -183,15 +195,20 @@ with st.expander("ℹ️ 추출 규칙 안내"):
         """
 - **시즌 / 스타일 / DESCRIPTION**: 파일명 시작 부분의 `F27-1234567_M FlyLux ...` 형식에서 자동 추출합니다.
 - **가장 최근 값만 표시**: 여러 번 제출된 이력이 있어도 컬럼이 늘어나지 않도록, 스타일/컬러웨이별로
-  가장 최근(제출일이 가장 늦은, 동점이면 시트 탭이 더 왼쪽/최신인 쪽) 제출분의 FOB/CM/MARGIN%만
-  한 줄로 보여줍니다. STAGE 칸에는 그 값이 어느 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)에서 나온
-  것인지 참고용으로 표시됩니다.
-- **CM**: CM 행의 우측("open"/개정 CM) TTL 값을 사용합니다. (우측 값이 없으면 좌측 값으로 대체)
+  가장 최근(제출일이 가장 늦은, 동점이면 시트 탭이 더 왼쪽/최신인 쪽) 제출분만 한 줄로 보여줍니다.
+  STAGE 칸에는 그 값이 어느 단계(P1/P2/P3, GTM1/GTM2, SMS, PP)에서 나온 것인지 참고용으로 표시됩니다.
+- **내부 / 오픈 구분**: 원가 시트의 좌측(제안/내부)과 우측(개정/오픈) 값을 각각 따로 추출합니다.
+  오픈 MARGIN%은 원본 파일에 별도 셀 자체가 없어(계산 로직을 알 수 없어) SUMMARY에 컬럼을 두지 않습니다.
+- **CM 수정 시 FOB·MARGIN% 자동 반영**: CM은 FOB 안에 포함된 원가 항목이므로(FOB = 기타 고정비용 + CM),
+  생성된 SUMMARY의 내부CM/오픈CM 칸(노란 배경)을 수정하면 그 변동분만큼 해당 FOB도 같이 움직이고,
+  내부MARGIN%도 자동으로 다시 계산됩니다. 내부/오픈은 서로 완전히 독립적으로 움직입니다 —
+  내부CM을 바꾸면 내부FOB·내부MARGIN%만, 오픈CM을 바꾸면 오픈FOB만 바뀝니다 (계산에 필요한
+  기준값은 '계산정보' 시트에 저장됩니다). 이 정보를 찾지 못한 행은 정적인 값만 표시되고 검토
+  표시가 남습니다.
+- **Style Description 정렬**: 성별(M/W) 접두어를 뗀 이름이 비슷한 항목끼리 자동으로 묶어서 정렬하고,
+  같은 이름 그룹 안에서는 M(남성)이 W(여성)보다 위에 오도록 정렬합니다.
 - **REMARK**: CM 옆 우측 REMARK 칸 중 노란색으로 강조된 내용을 가져오고, 노란색이 아니면 `[검토 필요]`로 표시됩니다.
   이전 단계 대비 변경점(노란색 강조 항목 기준)도 참고용으로 함께 기록됩니다.
-- **MARGIN %**: CBS 문구와 같은 행(그 블록의 최종 합계 행), LOSS 열에 적힌 값을 그대로 가져옵니다.
-  SOLID/HEATHER가 한 시트에 같이 있는 경우(주로 파일명에 FlyLux가 들어간 스타일) 컬러웨이별로
-  서로 다른 값을 각각 읽어옵니다. 찾지 못하면 비워두고 검토 표시를 남깁니다.
 - **시즌 표기 제외**: 시트 탭 이름에서 단계(P1~PP 등)를 못 찾을 경우, S27/F27 같은 시즌 표기는
   단계 라벨로 쓰지 않습니다.
 - **스타일번호 불일치 차단**: 시트 내용에 적힌 스타일번호가 파일명의 스타일번호와 다르면 데이터
