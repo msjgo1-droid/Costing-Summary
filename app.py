@@ -159,10 +159,6 @@ if rows:
                     margin_internal=(mrow["내부MARGIN %"] / 100.0) if pd.notna(mrow["내부MARGIN %"]) else None,
                     fob_open=mrow["오픈FOB"] if pd.notna(mrow["오픈FOB"]) else None,
                     cm_open=mrow["오픈CM"] if pd.notna(mrow["오픈CM"]) else None,
-                    other_cost_internal=next(
-                        (r.other_cost_internal for r in rows if r.style_no == str(mrow["STYLE NO"]) and r.colorway == mrow["COLORWAY"]),
-                        None,
-                    ),
                     remark=mrow["REMARK"] or "",
                 )
             )
@@ -200,11 +196,11 @@ with st.expander("ℹ️ 추출 규칙 안내"):
 - **내부 / 오픈 구분**: 원가 시트의 좌측(제안/내부)과 우측(개정/오픈) 값을 각각 따로 추출합니다.
   오픈 MARGIN%은 원본 파일에 별도 셀 자체가 없어(계산 로직을 알 수 없어) SUMMARY에 컬럼을 두지 않습니다.
 - **CM 수정 시 FOB·MARGIN% 자동 반영**: CM은 FOB 안에 포함된 원가 항목이므로(FOB = 기타 고정비용 + CM),
-  생성된 SUMMARY의 내부CM/오픈CM 칸(노란 배경)을 수정하면 그 변동분만큼 해당 FOB도 같이 움직이고,
-  내부MARGIN%도 자동으로 다시 계산됩니다. 내부/오픈은 서로 완전히 독립적으로 움직입니다 —
-  내부CM을 바꾸면 내부FOB·내부MARGIN%만, 오픈CM을 바꾸면 오픈FOB만 바뀝니다 (계산에 필요한
-  기준값은 '계산정보' 시트에 저장됩니다). 이 정보를 찾지 못한 행은 정적인 값만 표시되고 검토
-  표시가 남습니다.
+  생성된 SUMMARY의 내부CM/오픈CM 칸(노란 배경)을 수정하면 그 변동분만큼 해당 FOB도 같이 움직입니다.
+  내부CM을 바꾸면 내부FOB만, 오픈CM을 바꾸면 오픈FOB만 바뀝니다 (계산에 필요한 기준값은
+  '계산정보' 시트에 저장됩니다). 내부MARGIN%는 원본 파일의 실제 수식과 동일하게
+  `1-(내부FOB/오픈FOB)`로 계산되므로, 내부CM과 오픈CM 중 어느 쪽을 바꾸어도 함께 재계산됩니다.
+  이 정보를 찾지 못한 행은 정적인 값만 표시되고 검토 표시가 남습니다.
 - **Style Description 정렬**: 성별(M/W) 접두어를 뗀 이름이 비슷한 항목끼리 자동으로 묶어서 정렬하고,
   같은 이름 그룹 안에서는 M(남성)이 W(여성)보다 위에 오도록 정렬합니다.
 - **REMARK**: CM 옆 우측 REMARK 칸 중 노란색으로 강조된 내용을 가져오고, 노란색이 아니면 `[검토 필요]`로 표시됩니다.

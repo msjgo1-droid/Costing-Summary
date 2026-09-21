@@ -7,14 +7,15 @@ SUMMARY 차트(엑셀)를 새로 만들거나 기존 SUMMARY 파일에 새 제�
   내부 FOB | 내부 CM | 내부 Margin % | 오픈 FOB | 오픈 CM | REMARK
 
 CM은 FOB 안에 포함되어 있는 원가 구성요소이므로(FOB = 원부자재비 등 기타 고정비용 + CM),
-CM을 수정하면 그만큼 FOB도 같이 움직이고, 그에 따라 내부 MARGIN%도 재계산되어야 한다.
-내부/오픈은 서로 독립적으로 움직인다 (내부CM을 바꾸면 내부FOB만, 오픈CM을 바꾸면
-오픈FOB만 바뀐다). 이를 위해 '계산정보' 시트에 스타일별 기준값(생성 시점의 내부/오픈
-FOB·CM, 그리고 내부 고정비용=CM 제외 나머지)을 저장해두고, Summary의 FOB·MARGIN% 칸은
-그 기준값과 현재 CM 칸을 참조하는 엑셀 수식으로 만든다:
+CM을 수정하면 그만큼 FOB도 같이 움직인다. 내부FOB는 내부CM에, 오픈FOB는 오픈CM에만
+연동된다 (내부CM을 바꾸면 내부FOB만, 오픈CM을 바꾸면 오픈FOB만 바뀐다). 이를 위해
+'계산정보' 시트에 스타일별 기준값(생성 시점의 내부/오픈 FOB·CM)을 저장해두고,
+Summary의 FOB 칸은 그 기준값과 현재 CM 칸을 참조하는 엑셀 수식으로 만든다:
   FOB_new = FOB_기준값 + (CM_new - CM_기준값)
-  MARGIN%_new = 1 - ((내부고정비용 + CM_new) / FOB_new)
-오픈 MARGIN%는 원본 파일에 별도 셀 자체가 없어(=계산 로직을 알 수 없어) 컬럼을 두지 않는다.
+내부MARGIN%는 원본 파일의 실제 수식과 동일하게 '1 - (내부FOB / 오픈FOB)'로 계산한다.
+그래서 내부CM뿐 아니라 오픈CM을 바꿔도(분모인 오픈FOB가 바뀌므로) 내부MARGIN%가
+같이 재계산된다. 오픈 MARGIN%는 원본 파일에 별도 셀 자체가 없어(=계산 로직을 알 수
+없어) 컬럼을 두지 않는다.
 """
 import io
 import re
@@ -47,10 +48,6 @@ class SummaryRow:
     margin_internal: Optional[float] = None
     fob_open: Optional[float] = None
     cm_open: Optional[float] = None
-    # 내부 Net 합계(CM 포함) - 내부 CM = CM을 제외한 내부 고정비용.
-    # 내부 CM을 수정했을 때 '내부FOB = 기준FOB+(새CM-기준CM)', 그리고
-    # 'MARGIN% = 1-((고정비용+새CM)/내부FOB)' 식으로 재계산할 수 있도록 저장해둔다.
-    other_cost_internal: Optional[float] = None
     remark: str = ""
 
     @property
@@ -214,7 +211,6 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
                 margin_internal=margin_internal,
                 fob_open=fob_open,
                 cm_open=cm_open,
-                other_cost_internal=None,
                 remark=remark_val or "",
             )
         )
@@ -239,8 +235,6 @@ def merge_rows(existing: list[SummaryRow], new: list[SummaryRow]) -> list[Summar
                 er.fob_open = nr.fob_open
             if nr.cm_open is not None:
                 er.cm_open = nr.cm_open
-            if nr.other_cost_internal is not None:
-                er.other_cost_internal = nr.other_cost_internal
             if nr.stage:
                 er.stage = nr.stage
             if nr.description:
@@ -257,9 +251,10 @@ def merge_rows(existing: list[SummaryRow], new: list[SummaryRow]) -> list[Summar
 
 calc_ws_note = (
     "※ 이 시트는 계산용입니다. 직접 값을 고치지 마세요. Summary 시트 생성 시점의 "
-    "FOB·CM 기준값을 저장해두고, Summary의 FOB·MARGIN% 칸이 이 기준값과 현재 CM 칸을 "
-    "참조하는 수식으로 계산되게 합니다 (CM은 FOB 안에 포함된 항목이라, CM이 바뀌면 그만큼 "
-    "FOB도 같이 움직이고 MARGIN%도 재계산됩니다. 내부/오픈은 서로 독립적으로 움직입니다)."
+    "FOB·CM 기준값을 저장해두고, Summary의 FOB 칸이 이 기준값과 현재 CM 칸을 참조하는 "
+    "수식으로 계산되게 합니다 (CM은 FOB 안에 포함된 항목이라, CM이 바뀌면 그만큼 FOB도 "
+    "같이 움직입니다. 내부CM은 내부FOB만, 오픈CM은 오픈FOB만 움직입니다). 내부MARGIN%는 "
+    "'1-(내부FOB/오픈FOB)'로 계산되므로, 내부CM과 오픈CM 중 어느 쪽을 바꾸어도 함께 재계산됩니다."
 )
 
 
@@ -291,7 +286,7 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
 
     calc_ws = wb.create_sheet(CALC_SHEET_NAME)
     CALC_HEADERS = [
-        "Style/Colour", "내부FOB(기준값)", "내부CM(기준값)", "내부 고정비용(CM 제외)",
+        "Style/Colour", "내부FOB(기준값)", "내부CM(기준값)",
         "오픈FOB(기준값)", "오픈CM(기준값)",
     ]
     for i, name in enumerate(CALC_HEADERS):
@@ -299,9 +294,9 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
         c.font = Font(name=FONT_NAME, bold=True, size=9)
     calc_ws.cell(row=header_row, column=len(CALC_HEADERS) + 2, value=calc_ws_note)
     calc_ws.cell(row=header_row, column=len(CALC_HEADERS) + 2).font = Font(name=FONT_NAME, size=9, italic=True, color="FF808080")
-    for col, w in {1: 20, 2: 14, 3: 14, 4: 18, 5: 14, 6: 14, 8: 90}.items():
+    for col, w in {1: 20, 2: 14, 3: 14, 4: 14, 5: 14, 7: 90}.items():
         calc_ws.column_dimensions[get_column_letter(col)].width = w
-    CALC_COL_STYLE, CALC_COL_FOB_I, CALC_COL_CM_I, CALC_COL_OTHERCOST, CALC_COL_FOB_O, CALC_COL_CM_O = 1, 2, 3, 4, 5, 6
+    CALC_COL_STYLE, CALC_COL_FOB_I, CALC_COL_CM_I, CALC_COL_FOB_O, CALC_COL_CM_O = 1, 2, 3, 4, 5
 
     currency_fmt = '_(\\$* #,##0.00_);_(\\$* \\(#,##0.00\\);_(\\$* "-"??_);_(@_)'
 
@@ -378,10 +373,12 @@ def build_summary_workbook(rows: list[SummaryRow], season_label: str, brand: str
         else:
             fob_o_cell.value = row_data.fob_open
 
-        if row_data.other_cost_internal is not None and has_internal_baseline:
-            calc_ws.cell(row=r, column=CALC_COL_OTHERCOST, value=row_data.other_cost_internal)
-            otc_col_letter = get_column_letter(CALC_COL_OTHERCOST)
-            margin_i_cell.value = f"=1-(('{CALC_SHEET_NAME}'!{otc_col_letter}{r}+F{r})/E{r})"
+        # 내부MARGIN% = 1 - (내부FOB / 오픈FOB). 원본 파일의 실제 마진% 수식과
+        # 동일한 구조라, 내부CM뿐 아니라 오픈CM을 바꿔도(분모인 오픈FOB가 바뀌므로)
+        # 함께 재계산된다. 이 계산에는 내부FOB·오픈FOB 두 칸이 모두 값을 갖고
+        # 있어야 하므로(수식이든 고정값이든), 둘 다 있을 때만 수식으로 넣는다.
+        if row_data.fob_internal is not None and row_data.fob_open is not None:
+            margin_i_cell.value = f"=1-(E{r}/H{r})"
         else:
             margin_i_cell.value = row_data.margin_internal
             if row_data.fob_internal is not None:

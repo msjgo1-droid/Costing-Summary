@@ -69,21 +69,35 @@ def submitted_to_summary_rows(style_info, blocks_by_colorway: dict, season_overr
 
         stage_label = extract_stage(latest.sheet_name) if latest else ""
 
-        fob_internal = latest.fob if latest else None
+        # 내부FOB는 원가 시트의 CBS 확정가 칸(좌측)이 아니라 'Net' 행(좌측/내부
+        # 항목만 전부 합산한 값, CM 포함)에서 가져온다. CBS 확정가 칸(좌측)은
+        # 파일 안에서 '=+P41'처럼 오픈쪽 값을 그대로 가져오는 수식으로 되어 있어
+        # (미러링), 그 값을 내부FOB로 쓰면 내부FOB가 오픈FOB와 항상 똑같아져
+        # 버려서 잘못된 값이 된다. 반면 'Net' 행은 오픈쪽을 참조하지 않는, 순수
+        # 좌측(내부/제안) 항목들만 더한 값이라 이게 진짜 '내부FOB'다. ('Net' 행을
+        # 못 찾은 예전 파일은 CBS 확정가 칸 값으로 대체한다.)
         cm_internal = latest.cm if latest else None
-        margin_internal = latest.margin if latest else None
+        fob_internal = None
+        if latest is not None:
+            fob_internal = latest.internal_net if latest.internal_net is not None else latest.fob
 
         # 오픈(우측) FOB/CM 값이 파일에 없는 경우, 내부 값으로 보완한다 (보통
         # 좌우가 같거나 오픈 쪽만 채워져 있는 템플릿도 있어서). 오픈 MARGIN%는
         # 원본 파일에 별도 셀 자체가 없어(계산 로직을 알 수 없어) 다루지 않는다.
         fob_open = None
         cm_open = None
-        other_cost_internal = None
         if latest is not None:
             fob_open = latest.fob_right if latest.fob_right is not None else fob_internal
             cm_open = latest.cm_right if latest.cm_right is not None else cm_internal
-            if latest.internal_net is not None and cm_internal is not None:
-                other_cost_internal = latest.internal_net - cm_internal
+
+        # 내부MARGIN% = 1 - (내부FOB / 오픈FOB). 원본 파일의 실제 마진% 수식도
+        # 이와 동일한 구조다 (예: '=1-(I40/P41)' - I40이 내부 Net(=내부FOB),
+        # P41이 오픈FOB).
+        margin_internal = None
+        if fob_internal is not None and fob_open:
+            margin_internal = 1 - (fob_internal / fob_open)
+        elif latest is not None:
+            margin_internal = latest.margin
 
         row = SummaryRow(
             season=season_override or style_info.season,
@@ -96,7 +110,6 @@ def submitted_to_summary_rows(style_info, blocks_by_colorway: dict, season_overr
             margin_internal=margin_internal,
             fob_open=fob_open,
             cm_open=cm_open,
-            other_cost_internal=other_cost_internal,
             remark=remark_text,
         )
         row.needs_review = needs_review  # type: ignore[attr-defined]
