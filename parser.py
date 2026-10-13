@@ -286,10 +286,24 @@ def _declared_style_no(ws, header_row: int) -> Optional[str]:
 def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 컬러웨이를 추정한다.
     컬러 관련 표기가 전혀 없으면 SOLID로 본다 (PRINT/HEATHER는 항상 별도로
-    명시적으로 표기되어 있다는 것이 확인된 규칙)."""
+    명시적으로 표기되어 있다는 것이 확인된 규칙).
+
+    A열(S/#)은 제외하고 읽는다. 이 칸은 '이전 스타일 번호를 참고하라'는 식의
+    메모(예: '1181430 M Trail Top ET PRT', 'S27-1182655 W (C/O 1173533)')가
+    적혀있는 경우가 있는데, 특히 오래된(과거) 시트에서는 이 메모가 스타일이
+    개명/변경되기 전의 옛 제품명을 그대로 담고 있어서, 여기 우연히 'PRT' 같은
+    단어가 들어있으면 실제로는 PRINT가 아닌 컬러웨이(SOLID 등)를 PRINT로 잘못
+    인식해버린다 — 그러면 최신 시트에서는 정상적으로 SOLID로 묶이는데, 옛
+    시트 하나만 엉뚱하게 PRINT로 떨어져 나가 같은 컬러웨이인데도 가짜 컬러웨이
+    행이 하나 더 생기는 문제가 있었다. B열(SKETCH/COLOR)은 그대로 둔다 —
+    진짜로 PRINT 전용인 스타일(파일명 자체에 PRT가 들어간 경우 등)은 전체
+    시트에서 일관되게 B열에 표기되어 있어, 이 신호까지 없애면 반대로 PRINT
+    스타일을 SOLID로 잘못 인식하게 된다."""
     texts = []
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
+            if cell.column == 1:
+                continue
             if isinstance(cell.value, str):
                 texts.append(cell.value)
     blob = " ".join(texts).upper()
