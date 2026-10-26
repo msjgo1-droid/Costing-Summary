@@ -129,16 +129,25 @@ def parse_filename(filename: str) -> StyleInfo:
     # 맨 앞 타임스탬프 숫자열 제거 (예: 1789534333884_)
     base = re.sub(r"^\d{6,}_", "", base)
 
-    m = re.match(r"^([SF]\d{2}(?:[-/][SF]\d{2})?)[-_](\d{7})[_-]?(.*)$", base)
+    # 시즌+스타일번호 패턴을 파일명 "맨 앞"에서만 찾지 않고 전체에서 찾는다.
+    # 'addded_asia_htF27-1188892A_...'처럼 시즌/스타일 패턴 앞에 구분자 없이
+    # 다른 태그가 붙어있는 경우가 있는데, 맨 앞만 보면 매칭에 실패해서 파일명
+    # 전체가 그대로 DESCRIPTION으로 들어가 버리는 문제가 있었다.
+    # 스타일번호(7자리) 바로 뒤에 구분자 없이 영문 대문자 한 글자가 붙어있으면
+    # (예: '1188892A' - 아시아핏 버전 표기) 그 글자까지 스타일번호에 포함해서
+    # 잡는다. 'A'가 붙은 스타일과 안 붙은 스타일은 서로 다른 스타일로 취급해야
+    # 하기 때문이다.
+    m = re.search(r"([SF]\d{2}(?:[-/][SF]\d{2})?)[-_](\d{7}[A-Z]?)[_-]*", base)
     if not m:
         # 혹시 순서가 다르면 느슨하게라도 시즌/스타일만 찾는다
         season_m = re.search(r"[SF]\d{2}(?:[-/][SF]\d{2})?", base)
-        style_m = re.search(r"\d{7}", base)
+        style_m = re.search(r"\d{7}[A-Z]?", base)
         season = season_m.group(0) if season_m else ""
         style_no = style_m.group(0) if style_m else ""
         rest = base
     else:
-        season, style_no, rest = m.groups()
+        season, style_no = m.group(1), m.group(2)
+        rest = base[m.end():]
 
     # 성별 접두어(M/W)가 언더스코어 없이 바로 뒤 대문자 단어에 붙어있는 경우
     # (예: 'MSTMNT3_Woven_Short', 'WSTMNT_Warm_Up_Jacket')를 대비해, 맨 앞의
@@ -250,7 +259,7 @@ def _find_net_row(ws, item_col: int, start_row: int, end_row: int):
     return None
 
 
-STYLE_NO_LEADING_RE = re.compile(r"^\s*(\d{7})\b")
+STYLE_NO_LEADING_RE = re.compile(r"^\s*(\d{7}[A-Z]?)(?!\d)")
 
 
 def _sketch_color_col(ws, header_row: int, max_col: int = 8) -> Optional[int]:
