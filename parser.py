@@ -126,8 +126,12 @@ def parse_filename(filename: str) -> StyleInfo:
     """
     base = filename.rsplit("/", 1)[-1]
     base = re.sub(r"\.xlsx?$", "", base, flags=re.IGNORECASE)
-    # 맨 앞 타임스탬프 숫자열 제거 (예: 1789534333884_)
-    base = re.sub(r"^\d{6,}_", "", base)
+    # 맨 앞 타임스탬프 숫자열 제거 (예: 1789534333884_). 단, 스타일번호는 항상
+    # 정확히 7자리(+ 아시아핏 접미 영문 한 글자)이므로, 맨 앞이 '7자리(+영문 한 글자)
+    # 바로 뒤 구분자'모양이면 이건 타임스탬프가 아니라 스타일번호 그 자체이므로
+    # 지우면 안 된다 (예: '1194162_M_RaceDaySinglet...'를 타임스탬프로 오인해서
+    # 지워버리면 스타일번호를 통째로 잃어버리는 문제가 있었다).
+    base = re.sub(r"^(?!\d{7}[A-Z]?_)\d{6,}_", "", base)
 
     # 시즌+스타일번호 패턴을 파일명 "맨 앞"에서만 찾지 않고 전체에서 찾는다.
     # 'addded_asia_htF27-1188892A_...'처럼 시즌/스타일 패턴 앞에 구분자 없이
@@ -139,12 +143,24 @@ def parse_filename(filename: str) -> StyleInfo:
     # 하기 때문이다.
     m = re.search(r"([SF]\d{2}(?:[-/][SF]\d{2})?)[-_](\d{7}[A-Z]?)[_-]*", base)
     if not m:
-        # 혹시 순서가 다르면 느슨하게라도 시즌/스타일만 찾는다
+        # 시즌과 스타일번호가 서로 떨어져 있는 경우(예: 스타일번호가 맨 앞에,
+        # 시즌 표기는 설명 뒤쪽에 따로 붙어있는 경우)나, 시즌 표기가 파일명에
+        # 전혀 없는 경우를 대비해 시즌/스타일번호를 각각 독립적으로 찾는다.
         season_m = re.search(r"[SF]\d{2}(?:[-/][SF]\d{2})?", base)
         style_m = re.search(r"\d{7}[A-Z]?", base)
         season = season_m.group(0) if season_m else ""
         style_no = style_m.group(0) if style_m else ""
-        rest = base
+
+        # 찾아낸 시즌/스타일번호 부분은 DESCRIPTION에 섞여 들어가면 안 되므로
+        # base에서 해당 구간만 잘라내고 나머지를 이어붙여 rest를 만든다.
+        spans = sorted(s.span() for s in (season_m, style_m) if s)
+        rest_parts = []
+        pos = 0
+        for start, end in spans:
+            rest_parts.append(base[pos:start])
+            pos = end
+        rest_parts.append(base[pos:])
+        rest = "".join(rest_parts)
     else:
         season, style_no = m.group(1), m.group(2)
         rest = base[m.end():]
