@@ -107,6 +107,31 @@ def sort_rows(rows: list) -> list:
     return sorted(rows, key=_desc_sort_key)
 
 
+def _calc_sheet_baseline(wb) -> dict:
+    """'계산정보' 시트에서 {Style/Colour 텍스트: (내부FOB기준값, 내부CM기준값,
+    오픈FOB기준값, 오픈CM기준값)} 조회 테이블을 만든다. FOB 칸은 이 기준값과
+    현재 CM 칸을 참조하는 수식(예: '=계산정보!B2+(F2-계산정보!C2)')으로 되어
+    있는데, 이 파일을 한 번도 실제 Excel/Sheets에서 열어 재계산/저장한 적이
+    없으면 수식의 캐시된 계산값이 없어서(openpyxl은 수식을 직접 계산하지 않음)
+    data_only=True로 읽으면 FOB가 비어있는 값(None)으로 나온다. '계산정보'
+    시트의 기준값들은 수식이 아니라 그냥 숫자 값이라 캐시 문제 없이 항상 읽을
+    수 있으므로, FOB가 비어있을 때 이 기준값 + 현재 CM으로 직접 재계산해서
+    보완한다."""
+    if CALC_SHEET_NAME not in wb.sheetnames:
+        return {}
+    ws = wb[CALC_SHEET_NAME]
+    lookup = {}
+    for r in range(2, ws.max_row + 1):
+        key = ws.cell(row=r, column=1).value
+        if not key:
+            continue
+        key = str(key).strip()
+        vals = [ws.cell(row=r, column=c).value for c in (2, 3, 4, 5)]
+        vals = [v if isinstance(v, (int, float)) else None for v in vals]
+        lookup[key] = tuple(vals)
+    return lookup
+
+
 def parse_existing_summary(file_like) -> list[SummaryRow]:
     """기존 SUMMARY 엑셀에서 행 데이터를 읽어 SummaryRow 리스트로 반환.
 
@@ -114,9 +139,14 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
     FOB/CM/MARGIN% 방식, 그리고 더 예전의 날짜/단계별 여러 컬럼 방식을 모두
     최대한 인식한다. 예전 방식(그룹이 여러 개)이면 값이 채워진 마지막(=가장 최근)
     그룹의 값을 대표값으로 사용하고, 내부/오픈 구분이 없던 파일은 두 쪽 다 같은
-    값으로 채운다."""
+    값으로 채운다.
+
+    FOB/MARGIN% 칸이 수식인데 캐시된 계산값이 없어(파일을 실제 Excel에서 한
+    번도 안 열어본 경우) 비어있게 읽히면, '계산정보' 시트의 기준값으로 직접
+    재계산해서 채운다 (_calc_sheet_baseline 참고)."""
     wb = openpyxl.load_workbook(file_like, data_only=True)
     ws = wb[wb.sheetnames[0]]
+    calc_baseline = _calc_sheet_baseline(wb)
 
     header_row = None
     for r in range(1, min(ws.max_row, 10) + 1):
@@ -198,6 +228,18 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
                 if gm is not None:
                     margin_internal = gm
             fob_open, cm_open = fob_internal, cm_internal
+
+        # FOB가 비어있는데(수식 캐시값 없음) '계산정보' 시트에 이 스타일/컬러웨이의
+        # 기준값이 있으면 거기서 직접 재계산해서 보완한다.
+        base = calc_baseline.get(str(style_cell).strip()) if style_cell else None
+        if base:
+            base_fob_i, base_cm_i, base_fob_o, base_cm_o = base
+            if fob_internal is None and base_fob_i is not None and base_cm_i is not None and cm_internal is not None:
+                fob_internal = base_fob_i + (cm_internal - base_cm_i)
+            if fob_open is None and base_fob_o is not None and base_cm_o is not None and cm_open is not None:
+                fob_open = base_fob_o + (cm_open - base_cm_o)
+        if margin_internal is None and fob_internal is not None and fob_open:
+            margin_internal = 1 - (fob_internal / fob_open)
 
         rows.append(
             SummaryRow(
