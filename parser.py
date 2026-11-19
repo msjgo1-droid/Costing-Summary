@@ -116,6 +116,7 @@ class DateBlock:
     fob_right: Optional[float] = None  # 오픈(우측) FOB
     margin_right: Optional[float] = None  # 오픈(우측) MARGIN% (파일에 없는 경우가 많음)
     internal_net: Optional[float] = None  # 'Net' 행의 내부(좌측) 합계 (CM 포함, 마진 재계산용)
+    colorway_source: str = "default"  # 컬러웨이 이름을 어떻게 알아냈는지: 'label'/'keyword'/'default'
 
 
 def parse_filename(filename: str) -> StyleInfo:
@@ -333,7 +334,7 @@ def _colorway_label(ws, header_row: int, end_row: int) -> Optional[str]:
     return None
 
 
-def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
+def _colorway_from_block(ws, header_row: int, end_row: int, remark_cols: Optional[list] = None) -> tuple:
     """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 컬러웨이를 추정한다.
     컬러 관련 표기가 전혀 없으면 SOLID로 본다 (PRINT/HEATHER는 항상 별도로
     명시적으로 표기되어 있다는 것이 확인된 규칙).
@@ -352,25 +353,41 @@ def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     행이 하나 더 생기는 문제가 있었다. B열(SKETCH/COLOR)은 그대로 둔다 —
     진짜로 PRINT 전용인 스타일(파일명 자체에 PRT가 들어간 경우 등)은 전체
     시트에서 일관되게 B열에 표기되어 있어, 이 신호까지 없애면 반대로 PRINT
-    스타일을 SOLID로 잘못 인식하게 된다."""
+    스타일을 SOLID로 잘못 인식하게 된다.
+
+    REMARK 열(J/Q 등)도 키워드 추정 단계에서는 제외한다. REMARK 칸에는
+    'Sunjin) Reflective Print - Layout', '2 panels screen print'처럼 로고/공정
+    설명에 'print'라는 단어가 들어가는 경우가 있는데, 이건 원단 컬러웨이가
+    PRINT라는 뜻이 아니라 프린팅 가공(공정) 이야기라서 그대로 두면 SOLID를
+    PRINT로 잘못 인식해버린다. 단, 'COLORWAY: <이름>' 명시적 라벨은 보통 이
+    REMARK 칸 근처(J열 등)에 적혀있으므로, 그 라벨을 찾는 _colorway_label은
+    REMARK 열을 그대로 보고, 여기 키워드 블롭 추정 단계에서만 제외한다.
+
+    반환값은 (컬러웨이 이름, 신뢰도) 튜플이다. 신뢰도는 'label'(명시적
+    COLORWAY: 라벨), 'keyword'(HEATHER/PRINT 키워드 신호 있음), 'default'(아무
+    신호도 없어 그냥 SOLID로 기본 처리한 것) 중 하나다. 'default'는 신뢰도가
+    낮아서, 같은 파일 안에서 다른 시트는 명시적 라벨을 쓰는데 이 블록만 라벨이
+    없는 경우 호출하는 쪽(parse_submitted_workbook)에서 '구분 불가'로 보고
+    걸러낼 수 있도록 구분해둔다."""
     explicit = _colorway_label(ws, header_row, end_row)
     if explicit:
-        return explicit
+        return explicit, "label"
+    skip_cols = {1} | set(remark_cols or [])
     texts = []
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
-            if cell.column == 1:
+            if cell.column in skip_cols:
                 continue
             if isinstance(cell.value, str):
                 texts.append(cell.value)
     blob = " ".join(texts).upper()
     if "HEATHER" in blob:
-        return "HEATHER"
+        return "HEATHER", "keyword"
     if re.search(r"\bPRINT\b", blob) or re.search(r"\bPRT\b", blob):
-        return "PRINT"
+        return "PRINT", "keyword"
     if "SOLID" in blob:
-        return "SOLID"
-    return "SOLID" if header_row < end_row else "COLOR 2"
+        return "SOLID", "keyword"
+    return ("SOLID" if header_row < end_row else "COLOR 2"), "default"
 
 
 def parse_date_text(date_text: str, fallback_year: Optional[int] = None) -> Optional[dt.date]:
@@ -479,11 +496,18 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
             if isinstance(v, (int, float)):
                 internal_net = float(v)
 
-        colorway = _colorway_from_block(ws, hr, next_hr - 1)
-        # 같은 시트에 같은 컬러웨이가 중복되면 구분자 추가
-        existing = [b for b in blocks if b.colorway == colorway]
-        if existing:
-            colorway = f"{colorway} #{len(existing) + 1}"
+        colorway, colorway_source = _colorway_from_block(ws, hr, next_hr - 1, remark_cols=remark_cols)
+        # 같은 시트에 같은 컬러웨이가 중복되면 구분자 추가. '#숫자' 접미사를 뗀
+        # 원래 이름 기준으로 개수를 세야 한다 (그냥 b.colorway와 비교하면, 이미
+        # '#2'가 붙은 블록은 더 이상 원래 이름과 안 맞아서 세 번째 중복부터
+        # '#3'이 아니라 다시 '#2'가 되어버려 서로 다른 블록인데 이름이 겹치는
+        # 문제가 있었다).
+        raw_colorway = colorway
+        same_base_count = sum(
+            1 for b in blocks if re.sub(r"\s*#\d+$", "", b.colorway) == raw_colorway
+        )
+        if same_base_count:
+            colorway = f"{raw_colorway} #{same_base_count + 1}"
 
         blocks.append(
             DateBlock(
@@ -504,6 +528,7 @@ def parse_sheet(ws, sheet_name: str, style_no: str):
                 fob_right=fob_right,
                 margin_right=margin_right,
                 internal_net=internal_net,
+                colorway_source=colorway_source,
             )
         )
     return blocks, skip_notes
@@ -600,8 +625,19 @@ def parse_submitted_workbook(path: str, filename_for_parsing: Optional[str] = No
     # 같은 날짜가 겹치는 경우의 동점 처리 기준으로도 사용한다.
     sheet_order = {name: idx for idx, name in enumerate(reversed(wb.sheetnames))}
 
+    # 파일명에 시즌 표기가 전혀 없는 경우(예: '1193722A-_M_Skysummit_...'), 시트 탭
+    # 이름(예: 'GTM2 S28-11.12')에서 시즌을 찾아 보완한다. 탭은 맨 왼쪽이 최신이므로
+    # 맨 왼쪽 탭부터 순서대로 찾아서 가장 최근 제출 시점의 시즌을 쓴다.
+    if not style_info.season:
+        for sheet_name in wb.sheetnames:
+            m = re.search(r"[SF]\d{2}", sheet_name)
+            if m:
+                style_info.season = m.group(0).upper()
+                break
+
     all_blocks_by_colorway: dict[str, list[DateBlock]] = {}
     all_skip_notes: list[str] = []
+    all_blocks_flat: list[DateBlock] = []
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
@@ -609,10 +645,28 @@ def parse_submitted_workbook(path: str, filename_for_parsing: Optional[str] = No
         all_skip_notes.extend(skip_notes)
         for b in blocks:
             b.sheet_order = sheet_order.get(sheet_name, 0)
-            # normalize colorway name: strip numbering suffix used only for
-            # within-sheet de-dup and merge back for cross-sheet grouping
-            base_colorway = re.sub(r"\s*#\d+$", "", b.colorway)
-            all_blocks_by_colorway.setdefault(base_colorway, []).append(b)
+            all_blocks_flat.append(b)
+
+    # 이 파일이 'COLORWAY: <이름>' 명시적 라벨 방식을 쓰는 파일인지 확인한다
+    # (CBS 사이트 연동 파일 등 최근 템플릿에서 도입된 방식). 이런 파일은 최신
+    # 시트에서는 라벨로 컬러웨이를 정확히 구분하지만, 라벨이 도입되기 전의
+    # 옛 시트(SMS/PI 등)는 라벨이 없어 구분 신호가 전혀 없는 채로 그냥 기본값
+    # 'SOLID'로 처리된다. 이 '구분 불가' 블록을 그대로 두면, 최신 시트에는 없는
+    # 가짜 'SOLID' 컬러웨이 행이 하나 더 생겨서 옛(SMS 등) 데이터가 최신인 것처럼
+    # 섞여 나오는 문제가 있었다. 그래서 파일 안에 라벨 방식 블록이 하나라도
+    # 있으면, 신호가 전혀 없는 'default' 블록은 무시하고 경고만 남긴다.
+    uses_label_convention = any(b.colorway_source == "label" for b in all_blocks_flat)
+    for b in all_blocks_flat:
+        if uses_label_convention and b.colorway_source == "default":
+            all_skip_notes.append(
+                f"[{b.sheet_name}] 컬러웨이를 구분할 신호(COLORWAY 라벨 등)가 없어 "
+                f"해당 블록을 무시했습니다 (다른 시트는 COLORWAY 라벨을 쓰는 파일입니다)."
+            )
+            continue
+        # normalize colorway name: strip numbering suffix used only for
+        # within-sheet de-dup and merge back for cross-sheet grouping
+        base_colorway = re.sub(r"\s*#\d+$", "", b.colorway)
+        all_blocks_by_colorway.setdefault(base_colorway, []).append(b)
 
     # 날짜 파싱 및 정렬 (날짜가 있으면 날짜 우선, 없으면 시트 탭 순서로 보완;
     # 날짜가 같으면 시트 탭 순서(sheet_order)가 더 큰 쪽=더 왼쪽/최신 탭이 뒤로 온다)
