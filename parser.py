@@ -292,10 +292,39 @@ def _declared_style_no(ws, header_row: int) -> Optional[str]:
     return None
 
 
+COLORWAY_LABEL_RE = re.compile(r"\bCOLORWAY\s*:\s*(.+)", re.IGNORECASE)
+
+
+def _colorway_label(ws, header_row: int, end_row: int) -> Optional[str]:
+    """블록 안에 'COLORWAY: BLACK', 'COLORWAY: DARK ARUGULA / FROST'처럼 명시적으로
+    적힌 컬러웨이 이름이 있으면 그 이름을 그대로 반환한다 (보통 header_row 바로 위,
+    J열 즈음에 있다). FlyLux처럼 SOLID/HEATHER만 구분되는 파일과 달리, '같은
+    SOLID인데 블랙은 가격이 다르고 다른 컬러는 또 다른 가격'처럼 SOLID 안에서
+    색상명으로만 구분되는 여러 컬러웨이가 있는 스타일(CBS 사이트 연동 파일 등)은
+    이 명시적 라벨이 있어야 서로 다른 컬러웨이로 정확히 구분할 수 있다. 라벨이
+    없으면 None을 반환해서, 호출하는 쪽이 기존 HEATHER/PRINT/SOLID 키워드 추정
+    방식으로 넘어가게 한다."""
+    for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
+        for cell in row:
+            if cell.column == 1:
+                continue
+            if isinstance(cell.value, str):
+                m = COLORWAY_LABEL_RE.search(cell.value)
+                if m:
+                    name = re.sub(r"\s+", " ", m.group(1)).strip().upper()
+                    if name:
+                        return name
+    return None
+
+
 def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     """블록 내 원단 설명(주로 header_row 근처 R열 등)에서 컬러웨이를 추정한다.
     컬러 관련 표기가 전혀 없으면 SOLID로 본다 (PRINT/HEATHER는 항상 별도로
     명시적으로 표기되어 있다는 것이 확인된 규칙).
+
+    'COLORWAY: <이름>'처럼 명시적인 라벨이 있으면 그걸 최우선으로 쓴다
+    (_colorway_label 참고). 없을 때만 아래의 HEATHER/PRINT/SOLID 키워드 추정으로
+    넘어간다.
 
     A열(S/#)은 제외하고 읽는다. 이 칸은 '이전 스타일 번호를 참고하라'는 식의
     메모(예: '1181430 M Trail Top ET PRT', 'S27-1182655 W (C/O 1173533)')가
@@ -308,6 +337,9 @@ def _colorway_from_block(ws, header_row: int, end_row: int) -> str:
     진짜로 PRINT 전용인 스타일(파일명 자체에 PRT가 들어간 경우 등)은 전체
     시트에서 일관되게 B열에 표기되어 있어, 이 신호까지 없애면 반대로 PRINT
     스타일을 SOLID로 잘못 인식하게 된다."""
+    explicit = _colorway_label(ws, header_row, end_row)
+    if explicit:
+        return explicit
     texts = []
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
