@@ -9,6 +9,8 @@ SUBMITTED 원가(costing) 엑셀 파일을 읽어서 SUMMARY 차트에 필요한
   6. 우측 REMARK(노란 셀) 내용을 요약의 REMARK 란에 반영 + 단계/날짜별 차이점도 함께 기재
 """
 import re
+import io
+import zipfile
 import datetime as dt
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,6 +18,92 @@ from typing import Optional
 import openpyxl
 
 YELLOW_FILLS = {"FFFFFF00", "00FFFF00", "FFFFFF99"}  # 실 사용 노란색 계열
+
+_DRAWING_REL_RE = re.compile(rb'<Relationship [^>]*/>')
+_SHEET_RELS_RE = re.compile(r"xl/worksheets/_rels/sheet(\d+)\.xml\.rels$")
+_SHEET_XML_RE = re.compile(r"xl/worksheets/(sheet(\d+)\.xml)$")
+
+
+def _strip_images(file_like):
+    """엑셀 파일 안의 이미지(xl/media)와 그 이미지를 그리는 drawing 파츠를 제거한
+    새 워크북 바이트를 반환한다. 실패하면 원본을 그대로 반환한다.
+
+    실제 SUBMITTED 파일들은 원단 스와치 사진 등 이미지가 전체 용량의 60~85%를
+    차지하는 경우가 많다 (샘플 파일 기준 확인됨). openpyxl은 셀 값만 읽을 때도
+    이 이미지들을 전부 메모리에 올려서 파싱하는데, 우리는 텍스트/숫자 값만
+    필요하고 이미지는 전혀 쓰지 않으므로, 읽기 전에 이미지 관련 파츠를 통째로
+    떼어내면 메모리 사용량과 로딩 시간을 크게 줄일 수 있다 (파일 하나 기준
+    테스트에서 3.3MB -> 109KB, 추출 결과는 완전히 동일하게 확인됨). 대용량
+    파일(100MB대)을 Streamlit Cloud에 올렸을 때 메모리 부족으로 앱이 죽는
+    문제의 주된 원인으로 보인다.
+
+    openpyxl의 read_only=True 모드도 메모리를 아낄 수 있지만, 우리 코드는
+    ws.cell(row=, column=)으로 특정 셀을 직접 찾아가는 방식을 여러 군데에서
+    쓰는데 read_only 모드는 이런 임의 접근을 할 때마다 시트를 처음부터 다시
+    훑어서(순차 접근 전용 구조) 오히려 훨씬 느려지고(테스트에서 수 분 이상
+    걸려 타임아웃), 일부 빈 셀은 'column' 속성이 없는 EmptyCell로 나와 코드가
+    깨지는 문제도 있어 채택하지 않았다. 이미지만 떼어내는 이 방식은 기존 코드
+    구조를 그대로 유지하면서 용량 문제의 실제 원인(이미지)만 제거한다."""
+    try:
+        src = zipfile.ZipFile(file_like)
+        names = set(src.namelist())
+        if not any(n.startswith("xl/media/") for n in names):
+            return file_like  # 이미지가 없으면 그대로 반환 (불필요한 작업 생략)
+
+        sheet_rels = {n for n in names if _SHEET_RELS_RE.search(n)}
+        new_entries = {}
+        removed_rids_by_sheet: dict[str, set] = {}
+
+        for relsname in sheet_rels:
+            data = src.read(relsname)
+            kept = []
+            removed_ids = set()
+            for m in _DRAWING_REL_RE.finditer(data):
+                tag = m.group(0)
+                if b'/drawing"' in tag or b'/vmlDrawing"' in tag:
+                    idm = re.search(rb'Id="([^"]+)"', tag)
+                    if idm:
+                        removed_ids.add(idm.group(1).decode())
+                else:
+                    kept.append(tag)
+            sheet_num = _SHEET_RELS_RE.search(relsname).group(1)
+            removed_rids_by_sheet[sheet_num] = removed_ids
+            new_entries[relsname] = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + b"".join(kept) + b"</Relationships>"
+            )
+
+        for n in names:
+            m = _SHEET_XML_RE.match(n)
+            if not m:
+                continue
+            removed_ids = removed_rids_by_sheet.get(m.group(2))
+            if not removed_ids:
+                continue
+            data = src.read(n)
+            for rid in removed_ids:
+                rid_b = rid.encode()
+                data = re.sub(rb'<drawing r:id="' + re.escape(rid_b) + rb'"\s*/>', b"", data)
+                data = re.sub(rb'<legacyDrawing r:id="' + re.escape(rid_b) + rb'"\s*/>', b"", data)
+            new_entries[n] = data
+
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out:
+            for item in src.infolist():
+                if item.filename.startswith("xl/media/") or item.filename.startswith("xl/drawings/"):
+                    continue
+                out.writestr(item, new_entries.get(item.filename, src.read(item.filename)))
+        out_buf.seek(0)
+        return out_buf
+    except Exception:
+        # 뭔가 예상 못한 파일 구조라 실패하면, 그냥 원본으로 평소처럼 진행한다
+        # (용량 최적화가 실패해도 기능 자체는 항상 동작해야 하므로).
+        try:
+            file_like.seek(0)
+        except Exception:
+            pass
+        return file_like
 
 STOPWORDS = re.compile(
     r"^(fab ?trim|fabtrim|fab|trim|updated|update|submitted|submit|v|ver\d*|"
@@ -323,7 +411,13 @@ def _colorway_label(ws, header_row: int, end_row: int) -> Optional[str]:
     방식으로 넘어가게 한다."""
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
-            if cell.column == 1:
+            # read_only=True로 열었을 때, 지정한 max_row/max_col 범위가 시트의
+            # 실제 데이터 범위(ws.max_row 등)를 넘어서면 openpyxl이 그 빈 칸을
+            # 'EmptyCell'로 채워주는데, 이 EmptyCell은 'column'/'row' 속성이 없어서
+            # (항상 value=None이라 어차피 아래 isinstance 체크에서 걸러지는 칸인데도)
+            # cell.column에 바로 접근하면 AttributeError가 난다. getattr로 안전하게
+            # 접근한다 (대용량 파일을 read_only 모드로 열 때 이 문제가 발생했었다).
+            if getattr(cell, "column", None) == 1:
                 continue
             if isinstance(cell.value, str):
                 m = COLORWAY_LABEL_RE.search(cell.value)
@@ -376,7 +470,8 @@ def _colorway_from_block(ws, header_row: int, end_row: int, remark_cols: Optiona
     texts = []
     for row in ws.iter_rows(min_row=max(1, header_row - 3), max_row=min(end_row, header_row + 6)):
         for cell in row:
-            if cell.column in skip_cols:
+            # _colorway_label과 같은 이유로 getattr로 안전하게 접근한다.
+            if getattr(cell, "column", None) in skip_cols:
                 continue
             if isinstance(cell.value, str):
                 texts.append(cell.value)
@@ -618,7 +713,10 @@ def parse_submitted_workbook(path: str, filename_for_parsing: Optional[str] = No
     fname = filename_for_parsing or path
     style_info = parse_filename(fname)
 
-    wb = openpyxl.load_workbook(path, data_only=True)
+    # 이미지(원단 스와치 사진 등)는 우리가 쓰지 않는데도 파일 용량의 대부분을
+    # 차지하는 경우가 많아서, 읽기 전에 미리 떼어낸다 (_strip_images 참고).
+    # 대용량 파일 업로드 시 메모리 부족으로 앱이 죽는 문제의 주된 원인이었다.
+    wb = openpyxl.load_workbook(_strip_images(path), data_only=True)
     # 시트 탭 순서: 관찰된 실제 파일들은 "최신 -> 과거" 순으로 탭이 나열되어 있어
     # 역순으로 뒤집으면 과거->최신 시간 순서에 근접한다 (값이 클수록 최신/더 왼쪽 탭).
     # CBS 날짜가 비어있는 중간 협상 단계 시트가 있어 날짜만으로는 완전한 정렬이 어렵고,

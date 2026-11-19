@@ -19,12 +19,80 @@ Summary의 FOB 칸은 그 기준값과 현재 CM 칸을 참조하는 엑셀 수�
 """
 import io
 import re
+import zipfile
 from dataclasses import dataclass
 from typing import Optional
 
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
+
+_DRAWING_REL_RE = re.compile(rb'<Relationship [^>]*/>')
+_SHEET_RELS_RE = re.compile(r"xl/worksheets/_rels/sheet(\d+)\.xml\.rels$")
+_SHEET_XML_RE = re.compile(r"xl/worksheets/(sheet(\d+)\.xml)$")
+
+
+def _strip_images(file_like):
+    """이미지(xl/media)와 관련 drawing 파츠를 떼어낸 워크북 바이트를 반환한다.
+    실패하면 원본을 그대로 반환한다. parser.py의 같은 이름 함수와 동일한
+    로직이다 (큰 SUBMITTED 파일에서 이미지가 용량의 대부분을 차지해서 메모리
+    부족을 일으키는 문제의 대응책 — 자세한 설명은 parser.py 쪽 주석 참고).
+    기존 SUMMARY 파일은 보통 이미지가 없어 작지만, 혹시 큰 파일이 들어와도
+    안전하도록 여기에도 동일하게 적용한다."""
+    try:
+        src = zipfile.ZipFile(file_like)
+        names = set(src.namelist())
+        if not any(n.startswith("xl/media/") for n in names):
+            return file_like
+        sheet_rels = {n for n in names if _SHEET_RELS_RE.search(n)}
+        new_entries = {}
+        removed_rids_by_sheet: dict[str, set] = {}
+        for relsname in sheet_rels:
+            data = src.read(relsname)
+            kept = []
+            removed_ids = set()
+            for m in _DRAWING_REL_RE.finditer(data):
+                tag = m.group(0)
+                if b'/drawing"' in tag or b'/vmlDrawing"' in tag:
+                    idm = re.search(rb'Id="([^"]+)"', tag)
+                    if idm:
+                        removed_ids.add(idm.group(1).decode())
+                else:
+                    kept.append(tag)
+            sheet_num = _SHEET_RELS_RE.search(relsname).group(1)
+            removed_rids_by_sheet[sheet_num] = removed_ids
+            new_entries[relsname] = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                + b"".join(kept) + b"</Relationships>"
+            )
+        for n in names:
+            m = _SHEET_XML_RE.match(n)
+            if not m:
+                continue
+            removed_ids = removed_rids_by_sheet.get(m.group(2))
+            if not removed_ids:
+                continue
+            data = src.read(n)
+            for rid in removed_ids:
+                rid_b = rid.encode()
+                data = re.sub(rb'<drawing r:id="' + re.escape(rid_b) + rb'"\s*/>', b"", data)
+                data = re.sub(rb'<legacyDrawing r:id="' + re.escape(rid_b) + rb'"\s*/>', b"", data)
+            new_entries[n] = data
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as out:
+            for item in src.infolist():
+                if item.filename.startswith("xl/media/") or item.filename.startswith("xl/drawings/"):
+                    continue
+                out.writestr(item, new_entries.get(item.filename, src.read(item.filename)))
+        out_buf.seek(0)
+        return out_buf
+    except Exception:
+        try:
+            file_like.seek(0)
+        except Exception:
+            pass
+        return file_like
 
 THIN = Side(style="thin")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -144,7 +212,7 @@ def parse_existing_summary(file_like) -> list[SummaryRow]:
     FOB/MARGIN% 칸이 수식인데 캐시된 계산값이 없어(파일을 실제 Excel에서 한
     번도 안 열어본 경우) 비어있게 읽히면, '계산정보' 시트의 기준값으로 직접
     재계산해서 채운다 (_calc_sheet_baseline 참고)."""
-    wb = openpyxl.load_workbook(file_like, data_only=True)
+    wb = openpyxl.load_workbook(_strip_images(file_like), data_only=True)
     ws = wb[wb.sheetnames[0]]
     calc_baseline = _calc_sheet_baseline(wb)
 
